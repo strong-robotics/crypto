@@ -1,0 +1,43 @@
+# FastAPI and server
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+pydantic==2.10.0
+
+# Database
+asyncpg  # PostgreSQL async driver
+# aiosqlite  # SQLite async driver (backup, commented out)
+
+# Environment and configuration
+python-dotenv
+
+# HTTP requests
+aiohttp
+requests
+
+# Logging and utilities
+rich
+
+# WebSocket support
+websockets
+
+# Solana address parsing
+base58
+
+# Solana transaction signing
+solders
+
+# Solana Python SDK
+solana
+
+# Testing
+pytest
+pytest-asyncio
+
+# Machine Learning
+numpy
+pandas
+scikit-learn
+torch
+torchvision
+pytorch-lightning

@@ -1,0 +1,42 @@
+{
+  "classes": [
+    "bad",
+    "best",
+    "flat",
+    "good",
+    "middle",
+    "risk"
+  ],
+  "feature_names": [
+    "segment_index",
+    "slope",
+    "r2",
+    "drop",
+    "recovery",
+    "neg_ratio",
+    "volatility",
+    "mean_price",
+    "median_price",
+    "max_price",
+    "min_price",
+    "length",
+    "buy_sum",
+    "sell_sum",
+    "sell_share"
+  ],
+  "segment_bounds": [
+    [
+      0,
+      35
+    ],
+    [
+      35,
+      85
+    ],
+    [
+      85,
+      125
+    ]
+  ],
+  "samples": 1021
+}

@@ -1,0 +1,3137 @@
+#!/usr/bin/env python3
+"""
+Універсальний бот для торгівлі токенами
+Приклади:
+    python trade.py --mode buy --amount 1.2 --key-id 2
+    python trade.py --mode sell --amount 0.8 --key-id 1
+
+    python3 _v1_buy_sell.py --mode sell --amount 0.9 --key-id 2 --token-address 8Tg6NK4nVe3uCz9FqhGqoY7Ed22th2YLULvCnRNnPBjR
+    python3 _v1_buy_sell.py --mode buy --amount 0.9 --key-id 2 --token-address 8Tg6NK4nVe3uCz9FqhGqoY7Ed22th2YLULvCnRNnPBjR
+"""
+
+import os
+import requests, base64, json, argparse, sys
+from typing import Optional, List, Tuple, Dict
+import asyncio
+import aiohttp
+from _v3_db_pool import get_db_pool
+from config import config
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+from ai.patterns.catalog import PatternCode, PATTERN_SEED
+
+# Global aiohttp session for async HTTP requests (non-blocking)
+_http_session: Optional[aiohttp.ClientSession] = None
+
+async def get_http_session() -> aiohttp.ClientSession:
+    """Get or create global aiohttp session for async HTTP requests"""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
+
+# === Конфігурація ===
+RPC = "https://mainnet.helius-rpc.com/?api-key=276cdc23-e3c7-4847-81f6-d8114f92e4c5"
+JUP = "https://lite-api.jup.ag/swap/v1"
+
+# === Токени ===
+SOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+SOL_DECIMALS = 9
+
+# Більшість токенів використовує 6 decimals
+TOKEN_DECIMALS = 6
+TARGET_RETURN = float(getattr(config, 'TARGET_RETURN', 0.20))
+TARGET_MULT = 1.0 + TARGET_RETURN
+ENTRY_MIN_SECONDS = int(getattr(config, 'SIM_ENTRY_ITERATION', 60))
+MAX_TOKEN_AGE_SEC = int(getattr(config, 'ETA_MAX_TOKEN_AGE_SEC', int(os.getenv("SIM_MAX_TOKEN_AGE_SEC", "120"))))
+MAX_WAIT_ITERATIONS = int(os.getenv("SIM_MAX_WAIT_ITER", "80"))
+CANDIDATE_AMOUNTS = [100.0, 80.0, 60.0, 50.0, 40.0, 30.0, 25.0, 20.0, 15.0, 12.0, 10.0, 7.5, 5.0]
+GOOD_PATTERN_CODES = tuple(
+    str(item["code"].value if hasattr(item["code"], "value") else item["code"])
+    for item in PATTERN_SEED
+    if item.get("tier") == "top" and item.get("code") not in (PatternCode.UNKNOWN,)
+)
+
+CANDIDATE_AMOUNTS = [100.0, 80.0, 60.0, 50.0, 40.0, 30.0, 25.0, 20.0, 15.0, 12.0, 10.0, 7.5, 5.0]
+
+
+def load_key_from_file(key_id: int):
+    """Завантажуємо приватний ключ з keys.json по ID"""
+    with open("keys.json") as f:
+        keys = json.load(f)
+
+    for k in keys:
+        if k["id"] == key_id:
+            return Keypair.from_bytes(bytes(k["bits"]))
+
+    sys.exit(1)
+
+
+async def get_sol_price():
+    """Отримати курс SOL → USDC (async, non-blocking)"""
+    test_amount = int(0.1 * (10**SOL_DECIMALS))
+    session = await get_http_session()
+    async with session.get(f"{JUP}/quote", params={
+        "inputMint": SOL_MINT,
+        "outputMint": USDC_MINT,
+        "amount": test_amount,
+        "slippageBps": 50
+    }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        quote = await resp.json()
+    return int(quote["outAmount"]) / (10**6) / 0.1
+
+
+async def get_free_wallet(conn, exclude_key_id: Optional[int] = None) -> Optional[Dict]:
+    """Знайти вільний реальний кошелек з keys.json.
+    
+    Вільний = не використовується жодним токеном (real_wallet_id IS NULL для всіх токенів з цим key_id)
+    
+    Returns:
+        dict with 'key_id', 'keypair', 'address' or None if no free wallet
+    """
+    try:
+        with open(config.WALLET_KEYS_FILE) as f:
+            keys = json.load(f)
+        
+        # Get all currently used key_ids from tokens
+        used_key_ids = set()
+        if exclude_key_id:
+            used_key_ids.add(exclude_key_id)
+        rows = await conn.fetch("SELECT DISTINCT real_wallet_id FROM tokens WHERE real_wallet_id IS NOT NULL")
+        for row in rows:
+            if row["real_wallet_id"]:
+                used_key_ids.add(int(row["real_wallet_id"]))
+        
+        # Find first free wallet
+        for k in keys:
+            key_id = k.get("id")
+            if key_id is None:
+                continue
+            if int(key_id) not in used_key_ids:
+                try:
+                    kp = Keypair.from_bytes(bytes(k["bits"]))
+                    return {
+                        "key_id": key_id,
+                        "keypair": kp,
+                        "address": str(kp.pubkey())
+                    }
+                except Exception:
+                    continue
+        
+        return None
+    except Exception as e:
+        # print(f"[get_free_wallet] Error: {e}")
+        return None
+
+
+async def get_wallet_balance_sol(keypair: Keypair) -> float:
+    """Отримати баланс SOL для реального кошелька"""
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [str(keypair.pubkey())]
+        }
+        # Get SOL balance (async, non-blocking)
+        session = await get_http_session()
+        async with session.post(RPC, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            res = await resp.json()
+        if "result" in res:
+            lamports = res["result"]["value"]
+            return lamports / (10**SOL_DECIMALS)
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+async def execute_buy(token_id: int, keypair: Keypair, amount_usd: float, token_address: str, token_decimals: int) -> Dict:
+    """Виконати реальну покупку токена через Jupiter API.
+    
+    Returns:
+        dict with success, signature, amount_tokens, price_usd, etc.
+    """
+    try:
+        sol_price = await get_sol_price()
+        if sol_price <= 0:
+            return {"success": False, "message": "Failed to get SOL price"}
+        
+        # Check balance
+        balance_sol = await get_wallet_balance_sol(keypair)
+        if balance_sol <= 0:
+            return {"success": False, "message": "Insufficient SOL balance"}
+        
+        # Calculate amount in SOL
+        sol_need = amount_usd / sol_price
+        if sol_need > balance_sol * 0.95:  # Leave 5% for fees
+            return {"success": False, "message": "Insufficient SOL balance (need fee buffer)"}
+        
+        raw_amount = int(sol_need * (10**SOL_DECIMALS))
+        
+        # Get quote (async, non-blocking)
+        session = await get_http_session()
+        async with session.get(f"{JUP}/quote", params={
+            "inputMint": SOL_MINT,
+            "outputMint": token_address,
+            "amount": raw_amount,
+            "slippageBps": 200
+        }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            quote = await resp.json()
+        
+        if "error" in quote:
+            return {"success": False, "message": f"Quote error: {quote.get('error', 'Unknown')}"}
+        
+        amount_tokens = int(quote["outAmount"]) / (10**token_decimals)
+        token_price_usd = amount_usd / amount_tokens if amount_tokens > 0 else 0
+        
+        # Calculate expected tokens (for slippage calculation)
+        # Get test quote to compare
+        test_amount = 1000 * (10**token_decimals)
+        async with session.get(f"{JUP}/quote", params={
+            "inputMint": SOL_MINT,
+            "outputMint": token_address,
+            "amount": int(0.001 * (10**SOL_DECIMALS)),  # Small amount for price test
+            "slippageBps": 50
+        }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            test_quote = await resp.json()
+        
+        expected_tokens_per_sol = 0.0
+        if "error" not in test_quote:
+            test_tokens = int(test_quote["outAmount"]) / (10**token_decimals)
+            test_sol = 0.001
+            expected_tokens_per_sol = test_tokens / test_sol if test_sol > 0 else 0.0
+        
+        # Calculate slippage
+        expected_tokens = sol_need * expected_tokens_per_sol if expected_tokens_per_sol > 0 else 0.0
+        actual_tokens = amount_tokens
+        slippage_tokens = expected_tokens - actual_tokens
+        slippage_pct = (slippage_tokens / expected_tokens * 100) if expected_tokens > 0 else 0.0
+        slippage_bps = int(slippage_pct * 100)  # Convert to basis points
+        
+        # Get price impact from quote
+        price_impact_pct = 0.0
+        if 'priceImpactPct' in quote:
+            try:
+                price_impact_pct = float(quote['priceImpactPct']) if quote['priceImpactPct'] else 0.0
+            except (ValueError, TypeError):
+                price_impact_pct = 0.0
+        
+        # Transaction fee (fixed)
+        transaction_fee_sol = 0.00001  # Priority fee
+        transaction_fee_usd = transaction_fee_sol * sol_price
+        
+        # Expected vs actual amounts
+        expected_amount_usd = amount_usd  # What we intended to spend
+        actual_amount_usd = amount_usd  # What we actually spent (same for buy)
+        
+        # Build swap transaction (async, non-blocking)
+        async with session.post(f"{JUP}/swap", json={
+            "quoteResponse": quote,
+            "userPublicKey": str(keypair.pubkey()),
+            "computeUnitPriceMicroLamports": 10000  # Priority fee
+        }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            swap = await resp.json()
+        
+        if "error" in swap:
+            return {"success": False, "message": f"Swap error: {swap.get('error', 'Unknown')}"}
+        
+        # Sign and send transaction
+        tx_bytes = base64.b64decode(swap["swapTransaction"])
+        vtx = VersionedTransaction.from_bytes(tx_bytes)
+        vtx = VersionedTransaction(vtx.message, [keypair])
+        
+        signed_tx = base64.b64encode(bytes(vtx)).decode()
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "sendTransaction",
+            "params": [signed_tx, {"encoding": "base64", "preflightCommitment": "confirmed", "skipPreflight": False}]
+        }
+        
+        # Send transaction (async, non-blocking)
+        async with session.post(RPC, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            res = await resp.json()
+        
+        if "error" in res:
+            return {"success": False, "message": f"Transaction error: {res['error']}"}
+        
+        signature = res.get("result")
+        
+        # FORCE BUY/SELL: Return immediately after sending transaction (don't wait for confirmation)
+        # This makes force operations instant. Actual amounts will be updated later when confirmed.
+        # Use quote values for immediate response - they're usually accurate
+        
+        # Use quote values for immediate return (force operations need to be instant)
+        actual_tokens_received = amount_tokens  # From quote
+        actual_sol_spent = sol_need  # From quote
+        actual_price_usd = token_price_usd  # From quote
+        actual_amount_usd = amount_usd  # From quote
+        slippage_bps_actual = slippage_bps  # From quote
+        slippage_pct_actual = slippage_pct  # From quote
+        
+        # Note: Actual amounts from blockchain will be updated later when transaction confirms
+        # For force operations, user expects immediate response, not waiting for confirmation
+        
+        return {
+            "success": True,
+            "signature": signature,
+            "amount_tokens": actual_tokens_received,  # ACTUAL from blockchain
+            "amount_usd": actual_amount_usd,  # ACTUAL from blockchain
+            "price_usd": actual_price_usd,  # ACTUAL from blockchain
+            "sol_amount": actual_sol_spent,  # ACTUAL from blockchain
+            # Quote values (for comparison)
+            "quote_amount_tokens": amount_tokens,  # Expected from quote
+            "quote_amount_usd": amount_usd,  # Expected from quote
+            "quote_price_usd": token_price_usd,  # Expected from quote
+            # Transaction details for journal
+            "slippage_bps": slippage_bps_actual,  # ACTUAL slippage
+            "slippage_pct": slippage_pct_actual,  # ACTUAL slippage
+            "price_impact_pct": price_impact_pct,
+            "transaction_fee_sol": transaction_fee_sol,
+            "transaction_fee_usd": transaction_fee_usd,
+            "expected_amount_usd": expected_amount_usd,  # What we intended
+            "actual_amount_usd": actual_amount_usd  # What we actually got
+        }
+    except Exception as e:
+        return {"success": False, "message": f"Exception: {str(e)}"}
+
+
+async def sync_wallet_positions() -> dict:
+    """Синхронізувати стан реальних кошельків з blockchain при старті сервера.
+    
+    Перевіряє всі активні позиції (sim_buy_iteration IS NOT NULL, sim_sell_iteration IS NULL)
+    для реальних кошельків і оновлює БД, якщо токени вже продано через зовнішні кошельки.
+    
+    Returns:
+        dict with sync statistics
+    """
+    pool = await get_db_pool()
+    synced = 0
+    errors = 0
+    
+    async with pool.acquire() as conn:
+        # Find all active positions with real wallets
+        active_positions = await conn.fetch(
+            """
+            SELECT t.id AS token_id, t.token_address, t.decimals, t.real_wallet_id,
+                   t.sim_buy_token_amount, t.sim_buy_price_usd, t.sim_buy_iteration
+            FROM tokens t
+            WHERE t.sim_buy_iteration IS NOT NULL
+              AND t.sim_sell_iteration IS NULL
+              AND t.real_wallet_id IS NOT NULL
+              AND t.history_ready = FALSE
+            """
+        )
+        
+        if not active_positions:
+            return {"synced": 0, "errors": 0, "total": 0}
+        
+        # print(f"[sync_wallet_positions] Found {len(active_positions)} active positions to check")
+        
+        # Load wallet keys
+        try:
+            import json
+            import os
+            # Try server/keys.json first, then keys.json in current directory
+            keys_file = config.WALLET_KEYS_FILE
+            if not os.path.exists(keys_file):
+                keys_file = os.path.join("server", keys_file)
+            if not os.path.exists(keys_file):
+                keys_file = "keys.json"
+            
+            with open(keys_file) as f:
+                keys = json.load(f)
+        except Exception as e:
+            # print(f"[sync_wallet_positions] Failed to load keys.json from {keys_file}: {e}")
+            return {"synced": 0, "errors": len(active_positions), "total": len(active_positions)}
+        
+        for row in active_positions:
+            token_id = row["token_id"]
+            token_address = row["token_address"]
+            token_decimals = int(row["decimals"]) if row["decimals"] is not None else 6
+            
+            # Use real_wallet_id if available, otherwise try sim_wallet_id (might be real wallet in sim mode)
+            key_id = row["real_wallet_id"]
+            if key_id is None:
+                key_id = row["sim_wallet_id"]
+            
+            if key_id is None:
+                # print(f"[sync_wallet_positions] No wallet_id for token_id={token_id}, skipping")
+                errors += 1
+                continue
+            
+            key_id = int(key_id)
+            
+            try:
+                # Find wallet key
+                wallet_key = None
+                for k in keys:
+                    if k.get("id") == key_id:
+                        wallet_key = k
+                        break
+                
+                if not wallet_key:
+                    # Skip if wallet not in keys.json (might be virtual wallet)
+                    # print(f"[sync_wallet_positions] Wallet key_id={key_id} not found in keys.json for token_id={token_id}, skipping (might be virtual wallet)")
+                    continue
+                
+                # Load keypair
+                keypair = Keypair.from_bytes(bytes(wallet_key["bits"]))
+                
+                # Check real token balance
+                real_balance = await get_token_balance(keypair, token_address, token_decimals)
+                
+                # If balance is zero or very small (< 0.0001 tokens) - token was sold externally
+                if real_balance < 0.0001:
+                    # print(f"[sync_wallet_positions] Token {token_id} sold externally (balance: {real_balance}), syncing state...")
+                    
+                    # Get current price (use 0 if unavailable)
+                    current_price = 0.0
+                    try:
+                        price_row = await conn.fetchrow(
+                            "SELECT usd_price FROM tokens WHERE id=$1",
+                            token_id
+                        )
+                        if price_row and price_row["usd_price"]:
+                            current_price = float(price_row["usd_price"]) or 0.0
+                    except Exception:
+                        pass
+                    
+                    # Get iteration number
+                    rn = await conn.fetchval(
+                        "SELECT COUNT(*) FROM token_metrics_seconds WHERE token_id=$1",
+                        token_id
+                    ) or 0
+                    
+                    # Set sim_sell_* fields (mark as sold)
+                    await conn.execute(
+                        """
+                        UPDATE tokens SET
+                          sim_sell_token_amount = COALESCE(sim_sell_token_amount, sim_buy_token_amount),
+                          sim_sell_price_usd = $2,
+                          sim_sell_iteration = $3,
+                          sim_plan_sell_price_usd = $2,
+                          sim_plan_sell_iteration = $3,
+                          token_updated_at = CURRENT_TIMESTAMP
+                        WHERE id=$1
+                        """,
+                        token_id, current_price, rn
+                    )
+                    
+                    # Finalize sale (free wallet, update balance)
+                    try:
+                        await finalize_token_sale(token_id, conn, reason='external_sell')
+                        synced += 1
+                        # print(f"[sync_wallet_positions] ✅ Synced token_id={token_id} (sold externally)")
+                    except Exception as e:
+                        # print(f"[sync_wallet_positions] ❌ Error finalizing token_id={token_id}: {e}")
+                        errors += 1
+                else:
+                    # Token still in wallet - check if DB amount matches real balance
+                    db_amount = float(row["sim_buy_token_amount"]) if row["sim_buy_token_amount"] else 0.0
+                    if abs(db_amount - real_balance) / max(real_balance, 1.0) > 0.1:  # More than 10% difference
+                        # print(f"[sync_wallet_positions] ⚠️ Token {token_id} amount mismatch: DB={db_amount}, Real={real_balance}")
+                        # Update DB with actual balance
+                        await conn.execute(
+                            "UPDATE tokens SET sim_buy_token_amount=$1 WHERE id=$2",
+                            real_balance, token_id
+                        )
+                        synced += 1
+            except Exception as e:
+                # print(f"[sync_wallet_positions] ❌ Error processing token_id={token_id}: {e}")
+                errors += 1
+                continue
+        
+        # Also check wallets with active_token_id but no valid open position
+        # (mismatch: wallet thinks it's active but history says otherwise)
+        wallets_mismatch = await conn.fetch(
+            """
+            SELECT w.id AS wallet_id, w.active_token_id
+            FROM sim_wallets w
+            WHERE w.active_token_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM sim_wallet_history h
+                  WHERE h.wallet_id = w.id
+                    AND h.token_id = w.active_token_id
+                    AND h.exit_iteration IS NULL
+              )
+            """
+        )
+        
+        if wallets_mismatch:
+            # print(f"[sync_wallet_positions] Found {len(wallets_mismatch)} wallets with mismatched active_token_id")
+            for wallet in wallets_mismatch:
+                wallet_id = wallet["wallet_id"]
+                token_id = wallet["active_token_id"]
+                # Clear active_token_id - no open position exists
+                await conn.execute(
+                    "UPDATE sim_wallets SET active_token_id = NULL WHERE id=$1",
+                    wallet_id
+                )
+                synced += 1
+                # print(f"[sync_wallet_positions] ✅ Cleared active_token_id for wallet_id={wallet_id} (token_id={token_id} had no open position)")
+        
+        # Also check and close orphaned positions in sim_wallet_history
+        # (positions where token was deleted but history entry still has exit_iteration IS NULL)
+        orphaned_positions = await conn.fetch(
+            """
+            SELECT h.id, h.wallet_id, h.token_id, h.entry_amount_usd, h.entry_token_amount
+            FROM sim_wallet_history h
+            LEFT JOIN tokens t ON t.id = h.token_id
+            WHERE h.exit_iteration IS NULL
+              AND (t.id IS NULL OR t.sim_sell_iteration IS NOT NULL)
+            """
+        )
+        
+        if orphaned_positions:
+            # print(f"[sync_wallet_positions] Found {len(orphaned_positions)} orphaned positions to close")
+            for orphan in orphaned_positions:
+                try:
+                    history_id = orphan["id"]
+                    token_id = orphan["token_id"]
+                    wallet_id = orphan["wallet_id"]
+                    
+                    # Check if token exists and was sold
+                    token_exists = await conn.fetchrow("SELECT id, sim_sell_iteration FROM tokens WHERE id=$1", token_id)
+                    
+                    if token_exists:
+                        # Token exists and was sold - get sell data
+                        sell_price = await conn.fetchval("SELECT sim_sell_price_usd FROM tokens WHERE id=$1", token_id) or 0.0
+                        sell_iter = await conn.fetchval("SELECT sim_sell_iteration FROM tokens WHERE id=$1", token_id)
+                        sell_amount = await conn.fetchval("SELECT sim_sell_token_amount FROM tokens WHERE id=$1", token_id)
+                        exit_amount = float(sell_amount or 0) * float(sell_price or 0) if sell_amount and sell_price else 0.0
+                    else:
+                        # Token deleted - close position at 0
+                        sell_price = 0.0
+                        sell_iter = await conn.fetchval("SELECT COUNT(*) FROM token_metrics_seconds WHERE token_id=$1", token_id) or 0
+                        sell_amount = orphan["entry_token_amount"]
+                        exit_amount = 0.0
+                    
+                    # Close the history entry
+                    await conn.execute(
+                        """
+                        UPDATE sim_wallet_history SET
+                          exit_token_amount = $1,
+                          exit_price_usd = $2,
+                          exit_iteration = $3,
+                          exit_amount_usd = $4,
+                          outcome = 'closed',
+                          reason = CASE WHEN $5 IS NULL THEN 'token_deleted' ELSE 'external_sell' END,
+                          updated_at = CURRENT_TIMESTAMP
+                        WHERE id = $6
+                        """,
+                        sell_amount, sell_price, sell_iter, exit_amount, token_exists, history_id
+                    )
+                    
+                    # Calculate profit
+                    entry_amt = float(orphan["entry_amount_usd"] or 0)
+                    profit_usd = exit_amount - entry_amt
+                    profit_pct = (profit_usd / entry_amt * 100) if entry_amt > 0 else 0.0
+                    
+                    await conn.execute(
+                        "UPDATE sim_wallet_history SET profit_usd=$1, profit_pct=$2 WHERE id=$3",
+                        profit_usd, profit_pct, history_id
+                    )
+                    
+                    synced += 1
+                    # print(f"[sync_wallet_positions] ✅ Closed orphaned position history_id={history_id}, token_id={token_id}")
+                except Exception as e:
+                    # print(f"[sync_wallet_positions] ❌ Error closing orphaned position {orphan['id']}: {e}")
+                    errors += 1
+        
+        # print(f"[sync_wallet_positions] ✅ Sync complete: {synced} synced, {errors} errors, {len(active_positions)} total")
+        return {"synced": synced, "errors": errors, "total": len(active_positions)}
+
+
+async def get_token_balance(keypair: Keypair, token_address: str, token_decimals: int) -> float:
+    """Отримати реальний баланс токенів на кошельку"""
+    try:
+        balance_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                str(keypair.pubkey()),
+                {"mint": token_address},
+                {"encoding": "jsonParsed"}
+            ]
+        }
+        balance_resp = requests.post(RPC, json=balance_payload, timeout=10).json()
+        token_balance = 0.0
+        if "result" in balance_resp and balance_resp["result"]["value"]:
+            for account in balance_resp["result"]["value"]:
+                if account["account"]["data"]["parsed"]["info"]["mint"] == token_address:
+                    token_balance_raw = account["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]
+                    token_balance = float(token_balance_raw) / (10**token_decimals)
+                    break
+        return token_balance
+    except Exception as e:
+        return 0.0
+
+
+async def execute_sell(token_id: int, keypair: Keypair, token_address: str, token_amount: float, token_decimals: int, min_price_usd: float = None) -> Dict:
+    """Виконати реальну продажу токена через Jupiter API.
+    
+    Args:
+        token_amount: Бажана кількість для продажу (з БД), але використовується реальний баланс з кошелька
+    
+    Returns:
+        dict with success, signature, amount_sol, amount_usd, etc.
+    """
+    try:
+        sol_price = await get_sol_price()
+        if sol_price <= 0:
+            return {"success": False, "message": "Failed to get SOL price"}
+        
+        # CRITICAL: Get REAL token balance from wallet (not from DB)
+        # DB value may be incorrect due to rounding or other issues
+        real_token_balance = await get_token_balance(keypair, token_address, token_decimals)
+        
+        if real_token_balance <= 0:
+            return {"success": False, "message": f"No tokens in wallet (balance: {real_token_balance})"}
+        
+        # Determine actual sell amount:
+        # 1. If DB amount is specified and is close to real balance (within 5%) → use DB amount
+        # 2. If DB amount is much less than real balance (< 90%) → use DB amount (partial sell)
+        # 3. Otherwise → use real balance (sell all available)
+        if token_amount > 0:
+            # Check if DB amount is close to real balance (within 5% tolerance)
+            if abs(token_amount - real_token_balance) / real_token_balance <= 0.05:
+                # DB amount is close to real balance - use DB amount (preserves user intent)
+                actual_sell_amount = token_amount
+            elif token_amount < real_token_balance * 0.9:
+                # DB amount is much less - user wants partial sell
+                actual_sell_amount = token_amount
+            else:
+                # DB amount is more than real balance or close - use real balance
+                actual_sell_amount = real_token_balance
+        else:
+            # No DB amount specified - use real balance (sell all)
+            actual_sell_amount = real_token_balance
+        
+        # Ensure we don't try to sell more than we have
+        actual_sell_amount = min(actual_sell_amount, real_token_balance)
+        
+        if actual_sell_amount <= 0:
+            return {"success": False, "message": f"Calculated sell amount is zero (balance: {real_token_balance}, requested: {token_amount})"}
+        
+        # Get current token price (async, non-blocking)
+        session = await get_http_session()
+        test_amount = 1000 * (10**token_decimals)
+        async with session.get(f"{JUP}/quote", params={
+            "inputMint": token_address,
+            "outputMint": SOL_MINT,
+            "amount": test_amount,
+            "slippageBps": 50
+        }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            q_test = await resp.json()
+        
+        if "error" in q_test:
+            return {"success": False, "message": f"Price check error: {q_test.get('error', 'Unknown')}"}
+        
+        sol_out = int(q_test["outAmount"]) / (10**SOL_DECIMALS)
+        token_price_usd = (sol_out / 1000) * sol_price
+        
+        # Validate minimum price
+        if min_price_usd and token_price_usd < min_price_usd:
+            return {
+                "success": False,
+                "message": f"Current price (${token_price_usd:.8f}) below minimum (${min_price_usd:.8f})",
+                "current_price": token_price_usd,
+                "min_price": min_price_usd
+            }
+        
+        # Calculate amount to sell using REAL balance
+        raw_amount = int(actual_sell_amount * (10**token_decimals))
+        
+        # Get quote (async, non-blocking)
+        async with session.get(f"{JUP}/quote", params={
+            "inputMint": token_address,
+            "outputMint": SOL_MINT,
+            "amount": raw_amount,
+            "slippageBps": 200
+        }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            quote = await resp.json()
+        
+        if "error" in quote:
+            return {"success": False, "message": f"Quote error: {quote.get('error', 'Unknown')}"}
+        
+        expected_sol = int(quote["outAmount"]) / (10**SOL_DECIMALS)
+        expected_usd = expected_sol * sol_price
+        
+        # Calculate slippage (compare test quote with actual quote)
+        expected_sol_from_test = actual_sell_amount * (sol_out / 1000)  # Expected SOL from test quote
+        actual_sol = expected_sol
+        slippage_sol = expected_sol_from_test - actual_sol
+        slippage_pct = (slippage_sol / expected_sol_from_test * 100) if expected_sol_from_test > 0 else 0.0
+        slippage_bps = int(slippage_pct * 100)  # Convert to basis points
+        
+        # Get price impact from quote
+        price_impact_pct = 0.0
+        if 'priceImpactPct' in quote:
+            try:
+                price_impact_pct = float(quote['priceImpactPct']) if quote['priceImpactPct'] else 0.0
+            except (ValueError, TypeError):
+                price_impact_pct = 0.0
+        
+        # Transaction fee (fixed)
+        transaction_fee_sol = 0.00001  # Priority fee
+        transaction_fee_usd = transaction_fee_sol * sol_price
+        
+        # Expected vs actual amounts (use actual_sell_amount - real balance)
+        expected_amount_usd = actual_sell_amount * token_price_usd  # Expected from test quote
+        actual_amount_usd = expected_usd  # Actual from real quote
+        
+        # Build swap transaction (async, non-blocking)
+        async with session.post(f"{JUP}/swap", json={
+            "quoteResponse": quote,
+            "userPublicKey": str(keypair.pubkey()),
+            "computeUnitPriceMicroLamports": 10000  # Priority fee
+        }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            swap = await resp.json()
+        
+        if "error" in swap:
+            return {"success": False, "message": f"Swap error: {swap.get('error', 'Unknown')}"}
+        
+        # Sign and send transaction
+        tx_bytes = base64.b64decode(swap["swapTransaction"])
+        vtx = VersionedTransaction.from_bytes(tx_bytes)
+        vtx = VersionedTransaction(vtx.message, [keypair])
+        
+        signed_tx = base64.b64encode(bytes(vtx)).decode()
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "sendTransaction",
+            "params": [signed_tx, {"encoding": "base64", "preflightCommitment": "confirmed", "skipPreflight": False}]
+        }
+        
+        # Send transaction (async, non-blocking)
+        async with session.post(RPC, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            res = await resp.json()
+        
+        if "error" in res:
+            return {"success": False, "message": f"Transaction error: {res['error']}"}
+        
+        signature = res.get("result")
+        
+        # FORCE BUY/SELL: Return immediately after sending transaction (don't wait for confirmation)
+        # This makes force operations instant. Actual amounts will be updated later when confirmed.
+        # Use quote values for immediate response - they're usually accurate
+        
+        # Use quote values for immediate return (force operations need to be instant)
+        actual_sol_received = expected_sol  # From quote
+        actual_tokens_sold = actual_sell_amount  # From quote
+        actual_usd_received = expected_usd  # From quote
+        actual_price_usd = token_price_usd  # From quote
+        slippage_bps_actual = slippage_bps  # From quote
+        slippage_pct_actual = slippage_pct  # From quote
+        
+        # Note: Actual amounts from blockchain will be updated later when transaction confirms
+        # For force operations, user expects immediate response, not waiting for confirmation
+        
+        return {
+            "success": True,
+            "signature": signature,
+            "amount_sol": actual_sol_received,  # ACTUAL from blockchain
+            "amount_usd": actual_usd_received,  # ACTUAL from blockchain
+            "price_usd": actual_price_usd,  # ACTUAL from blockchain
+            "token_amount_sold": actual_tokens_sold,  # ACTUAL from blockchain
+            "token_amount_requested": token_amount,  # Original requested amount (from DB)
+            "token_balance_before": real_token_balance,  # Balance before sell
+            # Quote values (for comparison)
+            "quote_amount_sol": expected_sol,  # Expected from quote
+            "quote_amount_usd": expected_usd,  # Expected from quote
+            "quote_price_usd": token_price_usd,  # Expected from quote
+            # Transaction details for journal
+            "slippage_bps": slippage_bps_actual,  # ACTUAL slippage
+            "slippage_pct": slippage_pct_actual,  # ACTUAL slippage
+            "price_impact_pct": price_impact_pct,
+            "transaction_fee_sol": transaction_fee_sol,
+            "transaction_fee_usd": transaction_fee_usd,
+            "expected_amount_usd": expected_amount_usd,  # Expected from test quote
+            "actual_amount_usd": actual_usd_received  # ACTUAL from blockchain
+        }
+    except Exception as e:
+        return {"success": False, "message": f"Exception: {str(e)}"}
+
+
+def trade_tokens(kp: Keypair, usd_amount: float, mode: str, token_address: str):
+    """Купівля або продаж токенів за адресою"""
+
+    sol_price = get_sol_price() 
+
+    # 2. BUY → SOL -> TOKEN
+    if mode == "buy":
+        token_decimals = TOKEN_DECIMALS
+        try:
+            pool = asyncio.run(get_db_pool())
+            async def get_decimals():
+                async with pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT decimals FROM tokens WHERE token_address=$1",
+                        token_address
+                    )
+                    if row and row["decimals"]:
+                        return int(row["decimals"])
+                return TOKEN_DECIMALS
+            token_decimals = asyncio.run(get_decimals())
+        except Exception as e:
+            # print(f"   ⚠️ Не вдалося отримати decimals з БД, використовуємо дефолт {TOKEN_DECIMALS}: {e}")
+            pass
+        
+        balance_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [str(kp.pubkey())]
+        }
+
+        balance_resp = requests.post(RPC, json=balance_payload).json()
+        sol_balance = 0.0
+        
+        if "result" in balance_resp:
+            sol_balance_raw = balance_resp["result"].get("value", 0)
+            sol_balance = float(sol_balance_raw) / (10**SOL_DECIMALS)
+        
+        sol_need = usd_amount / sol_price
+        estimated_fee = 0.00001  # Приблизна комісія за транзакцію
+        if sol_balance < (sol_need + estimated_fee):
+            return
+        
+        raw_amount = int(sol_need * (10**SOL_DECIMALS))
+        test_amount = 1000 * (10**token_decimals)
+        q_test = requests.get(f"{JUP}/quote", params={
+            "inputMint": token_address,
+            "outputMint": SOL_MINT,
+            "amount": test_amount,
+            "slippageBps": 50
+        }).json()
+        
+        if "error" in q_test:
+            return
+        
+        sol_for_test = int(q_test["outAmount"]) / (10**SOL_DECIMALS)
+        token_price_usd = (sol_for_test / 1000) * sol_price
+        
+        quote = requests.get(f"{JUP}/quote", params={
+            "inputMint": SOL_MINT,
+            "outputMint": token_address,
+            "amount": raw_amount,
+            "slippageBps": 200
+        }).json()
+        
+        if "error" in quote:
+            return
+        
+        out_amount_raw = int(quote.get('outAmount', 0))
+        out_amount_tokens = out_amount_raw / (10**token_decimals)
+        out_amount_usd = out_amount_tokens * token_price_usd
+        
+        expected_tokens = sol_need / (sol_for_test / 1000)  # Очікувана кількість токенів за тестовою ціною
+        actual_tokens = out_amount_tokens
+        slippage_tokens = expected_tokens - actual_tokens
+        slippage_pct = (slippage_tokens / expected_tokens * 100) if expected_tokens > 0 else 0
+        
+        if 'priceImpactPct' in quote:
+            try:
+                price_impact = float(quote['priceImpactPct']) if quote['priceImpactPct'] else 0.0
+            except (ValueError, TypeError):
+                # print(f"   📉 Price impact: {quote['priceImpactPct']}")
+                pass
+        if 'platformFee' in quote and quote['platformFee']:
+            fee_info = quote['platformFee']
+        if 'fee' in quote:
+            fee_info = quote['fee']
+
+        swap = requests.post(f"{JUP}/swap", json={
+            "quoteResponse": quote,
+            "userPublicKey": str(kp.pubkey()),
+            "computeUnitPriceMicroLamports": 10000  # Priority fee
+        }).json()
+        
+        if "error" in swap:
+            return
+
+        tx_bytes = base64.b64decode(swap["swapTransaction"])
+        vtx = VersionedTransaction.from_bytes(tx_bytes)
+        vtx = VersionedTransaction(vtx.message, [kp])
+        
+        # Відправка через RPC
+        signed_tx = base64.b64encode(bytes(vtx)).decode()
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "sendTransaction",
+            "params": [signed_tx, {"encoding": "base64", "preflightCommitment": "confirmed", "skipPreflight": False}]
+        }
+        res = requests.post(RPC, json=payload, timeout=30).json()
+        
+        if "error" in res:
+            return
+        
+        sig = res.get("result")
+        if 'priceImpactPct' in quote:
+            try:
+                price_impact = float(quote['priceImpactPct']) if quote['priceImpactPct'] else 0.0
+            except (ValueError, TypeError):
+                # print(f"      Price impact: {quote['priceImpactPct']}")
+                pass
+
+    # 3. SELL → TOKEN -> SOL
+    elif mode == "sell":
+        token_decimals = TOKEN_DECIMALS
+        try:
+            pool = asyncio.run(get_db_pool())
+            async def get_decimals():
+                async with pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT decimals FROM tokens WHERE token_address=$1",
+                        token_address
+                    )
+                    if row and row["decimals"]:
+                        return int(row["decimals"])
+                return TOKEN_DECIMALS
+            token_decimals = asyncio.run(get_decimals())
+        except Exception as e:
+            # print(f"   ⚠️ Не вдалося отримати decimals з БД, використовуємо дефолт {TOKEN_DECIMALS}: {e}")
+            pass
+        
+        test_amount = 1000 * (10**token_decimals)
+        q_test = requests.get(f"{JUP}/quote", params={
+            "inputMint": token_address,
+            "outputMint": SOL_MINT,
+            "amount": test_amount,
+            "slippageBps": 50
+        }).json()
+        
+        if "error" in q_test:
+            return
+        
+        sol_out = int(q_test["outAmount"]) / (10**SOL_DECIMALS)
+        token_price_usd = (sol_out / 1000) * sol_price
+
+        tokens_to_sell = usd_amount / token_price_usd
+        raw_amount = int(tokens_to_sell * (10**token_decimals))
+        balance_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                str(kp.pubkey()),
+                {"mint": token_address},
+                {"encoding": "jsonParsed"}
+            ]
+        }
+        balance_resp = requests.post(RPC, json=balance_payload).json()
+        token_balance = 0.0
+
+        if "result" in balance_resp and balance_resp["result"]["value"]:
+            for account in balance_resp["result"]["value"]:
+                if account["account"]["data"]["parsed"]["info"]["mint"] == token_address:
+                    token_balance_raw = account["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]
+                    token_balance = float(token_balance_raw) / (10**token_decimals)
+                    break
+        if token_balance < tokens_to_sell:
+            return
+
+        quote = requests.get(f"{JUP}/quote", params={
+            "inputMint": token_address,
+            "outputMint": SOL_MINT,
+            "amount": raw_amount,
+            "slippageBps": 200
+        }).json()
+        
+        if "error" in quote:
+            return
+        
+        out_amount_raw = int(quote.get('outAmount', 0))
+        out_amount_sol = out_amount_raw / (10**SOL_DECIMALS)
+        out_amount_usd = out_amount_sol * sol_price
+        
+        expected_sol = tokens_to_sell * (sol_out / 1000)  # Очікувана кількість SOL за ціною з тесту
+        actual_sol = out_amount_sol
+        slippage_sol = expected_sol - actual_sol
+        slippage_pct = (slippage_sol / expected_sol * 100) if expected_sol > 0 else 0
+        
+        if 'priceImpactPct' in quote:
+            try:
+                price_impact = float(quote['priceImpactPct']) if quote['priceImpactPct'] else 0.0
+            except (ValueError, TypeError):
+                # print(f"   📉 Price impact: {quote['priceImpactPct']}")
+                pass
+        if 'platformFee' in quote and quote['platformFee']:
+            fee_info = quote['platformFee']
+        if 'fee' in quote:
+            fee_info = quote['fee']
+
+        swap = requests.post(f"{JUP}/swap", json={
+            "quoteResponse": quote,
+                "userPublicKey": str(kp.pubkey()),
+                "computeUnitPriceMicroLamports": 10000  # Priority fee
+        }).json()
+
+        if "error" in swap:
+            return
+
+    tx_bytes = base64.b64decode(swap["swapTransaction"])
+    vtx = VersionedTransaction.from_bytes(tx_bytes)
+    vtx = VersionedTransaction(vtx.message, [kp])
+
+        # Відправка через RPC
+    signed_tx = base64.b64encode(bytes(vtx)).decode()
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "sendTransaction",
+            "params": [signed_tx, {"encoding": "base64", "preflightCommitment": "confirmed", "skipPreflight": False}]
+    }
+    res = requests.post(RPC, json=payload, timeout=30).json()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", type=str, required=True, help="buy або sell")
+    parser.add_argument("--amount", type=float, required=True, help="Сума в USD")
+    parser.add_argument("--key-id", type=int, required=True, help="ID ключа з keys.json")
+    parser.add_argument("--token-address", type=str, required=True, help="Адреса токену для торгівлі")
+    args = parser.parse_args()
+
+    kp = load_key_from_file(args.key_id)
+    trade_tokens(kp, args.amount, args.mode.lower(), args.token_address)
+
+
+# =====================
+# Simulation utilities
+# =====================
+
+async def sim_buy(token_id: int, entry_sec: int = 30, amount_usd: float = None) -> bool:
+    """One-off: set sim_buy_* at entry_sec based on token_metrics_seconds.
+    Does nothing if sim_buy_* already set.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT sim_buy_token_amount, sim_buy_price_usd FROM tokens WHERE id=$1",
+            token_id,
+        )
+        if row and (row["sim_buy_token_amount"] is not None and row["sim_buy_price_usd"] is not None):
+            return False
+        # Try exact entry_sec first; if no price there, search within ±5 seconds
+        pr = await conn.fetchrow(
+            """
+            SELECT usd_price FROM token_metrics_seconds
+            WHERE token_id=$1 AND usd_price IS NOT NULL AND usd_price>0
+            ORDER BY ts ASC OFFSET $2 LIMIT 1
+            """,
+            token_id, max(0, entry_sec - 1)
+        )
+        if not pr or not pr["usd_price"]:
+            # Fallback: find nearest price within entry_sec ± 5 seconds
+            pr = await conn.fetchrow(
+                """
+                WITH numbered AS (
+                    SELECT usd_price, ROW_NUMBER() OVER (ORDER BY ts ASC) - 1 AS rn
+                    FROM token_metrics_seconds
+                    WHERE token_id=$1 AND usd_price IS NOT NULL AND usd_price>0
+                )
+                SELECT usd_price, ABS(rn - $2) AS dist
+                FROM numbered
+                WHERE rn BETWEEN GREATEST(0, $2 - 5) AND ($2 + 5)
+                ORDER BY dist ASC, rn ASC
+                LIMIT 1
+                """,
+                token_id, entry_sec
+            )
+            if not pr or not pr["usd_price"]:
+                return False
+        entry_price = float(pr["usd_price"]) or 0.0
+        if entry_price <= 0:
+            return False
+        if amount_usd is None:
+            try:
+                amount_usd = float(getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.0))
+            except Exception:
+                amount_usd = 5.0
+        amount_tokens = float(amount_usd) / entry_price
+        await conn.execute(
+            """
+            UPDATE tokens
+            SET sim_buy_token_amount=$2,
+                sim_buy_price_usd=$3,
+                sim_buy_iteration=$4,
+                token_updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1
+            """,
+            token_id, amount_tokens, entry_price, entry_sec
+        )
+        return True
+
+
+# =====================
+# Honeypot checker (pre-buy safety)
+# =====================
+async def check_honeypot(token_id: int, at_iter: Optional[int] = None) -> dict:
+    """Heuristic honeypot detector based on on-chain flags and recent buy/sell stats.
+
+    Returns dict: {"honeypot": bool, "reasons": [str], "buys": int, "sells": int}
+    Also updates tokens.is_honeypot, honeypot_checked_at, honeypot_reason.
+    """
+    pool = await get_db_pool()
+    reasons = []
+    buys = 0
+    sells = 0
+    is_hp = False
+    async with pool.acquire() as conn:
+        t = await conn.fetchrow(
+            """
+            SELECT token_address, holder_count, token_program,
+                   mint_authority_disabled, freeze_authority_disabled,
+                   top_holders_percentage, dev_balance_percentage
+            FROM tokens WHERE id=$1
+            """,
+            token_id
+        )
+        if not t:
+            return {"honeypot": False, "reasons": ["token_not_found"], "buys": 0, "sells": 0}
+
+        # Aggregate recent buy/sell counts over window
+        try:
+            win = int(getattr(config, 'HONEYPOT_WINDOW_SEC', 120))
+        except Exception:
+            win = 120
+        # Determine end_ts by target iteration (if provided) or by latest
+        if at_iter is not None and at_iter >= 1:
+            ts_row = await conn.fetchrow(
+                """
+                SELECT ts FROM (
+                  SELECT ts, ROW_NUMBER() OVER (ORDER BY ts ASC) AS rn
+                  FROM token_metrics_seconds
+                  WHERE token_id=$1 AND (usd_price IS NOT NULL AND usd_price > 0)
+                ) s WHERE rn=$2
+                """,
+                token_id, int(at_iter)
+            )
+        else:
+            ts_row = await conn.fetchrow(
+                "SELECT MAX(ts) AS ts FROM token_metrics_seconds WHERE token_id=$1 AND (usd_price IS NOT NULL AND usd_price > 0)",
+                token_id
+            )
+        end_ts = int(ts_row["ts"]) if ts_row and ts_row["ts"] is not None else None
+
+        rec = None
+        if end_ts is not None:
+            rec = await conn.fetchrow(
+                """
+                SELECT COALESCE(SUM(buy_count),0) AS buys,
+                       COALESCE(SUM(sell_count),0) AS sells
+                FROM token_metrics_seconds
+                WHERE token_id=$1
+                  AND (usd_price IS NOT NULL AND usd_price > 0)
+                  AND ts >= $2::bigint - $3::bigint
+                  AND ts <= $2::bigint
+                """,
+                token_id, end_ts, win
+            )
+        if rec:
+            buys = int(rec["buys"] or 0)
+            sells = int(rec["sells"] or 0)
+
+        # Heuristic rules
+        try:
+            min_buys = int(getattr(config, 'HONEYPOT_MIN_BUYS', 30))
+            max_sells = int(getattr(config, 'HONEYPOT_MAX_SELLS', 0))
+            min_sell_share = float(getattr(config, 'HONEYPOT_MIN_SELL_SHARE', 0.05))
+        except Exception:
+            min_buys, max_sells, min_sell_share = 30, 0, 0.05
+
+        # Rule 1: No sells with many buys
+        if buys >= min_buys and sells <= max_sells:
+            is_hp = True
+            reasons.append(f"no_sells_recent(buys={buys},sells={sells})")
+
+        # Rule 2: Too small sell share
+        tot = buys + sells
+        if not is_hp and tot >= min_buys:
+            share = (sells / tot) if tot > 0 else 0.0
+            if share < min_sell_share:
+                is_hp = True
+                reasons.append(f"low_sell_share({share:.3f})")
+
+        # Rule 3: Freeze authority still present
+        fa = t.get("freeze_authority_disabled")
+        if getattr(config, 'HONEYPOT_FLAG_FREEZE_AUTH', True) and (fa is False):
+            is_hp = True
+            reasons.append("freeze_authority_present")
+
+        # Rule 4: Mint authority still present (high-risk)
+        ma = t.get("mint_authority_disabled")
+        if ma is False:
+            is_hp = True
+            reasons.append("mint_authority_present")
+
+        # Optional note on extreme concentration (do not force flag by itself)
+        try:
+            thp = float(t.get("top_holders_percentage") or 0.0)
+            if thp >= 90.0:
+                reasons.append(f"top_holders_{thp:.1f}pct")
+        except Exception:
+            pass
+
+        # Rule 5: Zero-tail (consecutive null/zero prices)
+        try:
+            zero_tail_n = int(getattr(config, 'ZERO_TAIL_CONSEC_SEC', 10))
+        except Exception:
+            zero_tail_n = 10
+        if end_ts is not None and zero_tail_n > 0:
+            zr = await conn.fetchrow(
+                """
+                SELECT COUNT(*) AS zc
+                FROM token_metrics_seconds
+                WHERE token_id=$1 AND ts > ($2::bigint - $3::bigint) AND ts <= $2::bigint
+                  AND (usd_price IS NULL OR usd_price <= 0)
+                """,
+                token_id, end_ts, zero_tail_n
+            )
+            if zr and int(zr["zc"] or 0) >= zero_tail_n:
+                is_hp = True
+                reasons.append(f"zero_tail_{zero_tail_n}s")
+
+        await conn.execute(
+            """
+            UPDATE tokens
+            SET is_honeypot=$2,
+                honeypot_checked_at=CURRENT_TIMESTAMP,
+                honeypot_reason=$3,
+                token_updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1
+            """,
+            token_id, is_hp, ",".join(reasons) if reasons else None
+        )
+
+    return {"honeypot": bool(is_hp), "reasons": reasons, "buys": buys, "sells": sells}
+
+async def sim_sell(token_id: int, target_mult: float = TARGET_MULT) -> Optional[int]:
+    """Check последнюю секунду и, если цель достигнута, зафиксировать выход."""
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        t = await conn.fetchrow(
+            "SELECT sim_buy_token_amount, sim_buy_price_usd FROM tokens WHERE id=$1",
+            token_id
+        )
+        if not t or t["sim_buy_token_amount"] is None or t["sim_buy_price_usd"] is None:
+            return None
+        entry_price = float(t["sim_buy_price_usd"])
+        target = entry_price * float(target_mult)
+        row = await conn.fetchrow(
+            """
+            SELECT usd_price, rn FROM (
+              SELECT usd_price,
+                     ROW_NUMBER() OVER (ORDER BY ts ASC) AS rn
+              FROM token_metrics_seconds
+              WHERE token_id=$1 AND usd_price IS NOT NULL AND usd_price>0
+            ) s
+            ORDER BY rn DESC
+            LIMIT 1
+            """,
+            token_id
+        )
+        if not row:
+            return None
+        exit_price = float(row["usd_price"])
+        if exit_price < target:
+            return None
+        exit_iter = int(row["rn"])
+        await conn.execute(
+            """
+            UPDATE tokens
+            SET sim_sell_token_amount = COALESCE(sim_sell_token_amount, sim_buy_token_amount),
+                sim_sell_price_usd = $2,
+                sim_sell_iteration = $3,
+                token_updated_at = CURRENT_TIMESTAMP
+            WHERE id=$1
+              AND sim_buy_token_amount IS NOT NULL
+              AND (sim_sell_iteration IS NULL OR sim_sell_iteration < $3)
+            """,
+            token_id, exit_price, exit_iter
+        )
+        return exit_iter
+
+
+async def sim_current(token_id: int) -> bool:
+    """Recalculate current portfolio value and profit: sim_cur_income_price_usd, sim_profit_usd."""
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        t = await conn.fetchrow(
+            "SELECT sim_buy_token_amount, sim_buy_price_usd FROM tokens WHERE id=$1",
+            token_id
+        )
+        if not t or t["sim_buy_token_amount"] is None or t["sim_buy_price_usd"] is None:
+            return False
+        latest = await conn.fetchrow(
+            """
+            SELECT usd_price FROM token_metrics_seconds
+            WHERE token_id=$1 AND usd_price IS NOT NULL AND usd_price>0
+            ORDER BY ts DESC LIMIT 1
+            """,
+            token_id
+        )
+        if not latest or not latest["usd_price"]:
+            return False
+        amount = float(t["sim_buy_token_amount"]) or 0.0
+        entry_price = float(t["sim_buy_price_usd"]) or 0.0
+        cur_price = float(latest["usd_price"]) or 0.0
+        cur_value = amount * cur_price
+        profit = cur_value - (amount * entry_price) if entry_price > 0 else 0.0
+        await conn.execute(
+            "UPDATE tokens SET sim_cur_income_price_usd=$2, sim_profit_usd=$3, token_updated_at=CURRENT_TIMESTAMP WHERE id=$1",
+            token_id, cur_value, profit
+        )
+        return True
+
+
+# =====================
+# Background simulation loop (independent timer)
+# =====================
+_sim_task: Optional[asyncio.Task] = None
+
+
+async def _fetch_ids_needing_buy(conn) -> List[Tuple[int, int]]:
+    if not GOOD_PATTERN_CODES:
+        return []
+    rows = await conn.fetch(
+        """
+        WITH metrics AS (
+          SELECT token_id, COUNT(*) AS cnt
+          FROM token_metrics_seconds
+          WHERE usd_price IS NOT NULL AND usd_price > 0
+          GROUP BY token_id
+        )
+        SELECT t.id, metrics.cnt
+        FROM tokens t
+        JOIN metrics ON metrics.token_id = t.id
+        WHERE t.history_ready = FALSE
+          AND (t.sim_buy_token_amount IS NULL OR t.sim_buy_price_usd IS NULL)
+          AND t.sim_sell_iteration IS NULL
+          AND t.pattern_code IS NOT NULL
+          AND t.pattern_code <> ''
+          AND t.pattern_code = ANY($2::text[])
+          AND (
+            (t.first_pool_created_at IS NOT NULL AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.first_pool_created_at)) <= $3)
+            OR (t.first_pool_created_at IS NULL AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.created_at)) <= $3)
+          )
+          AND metrics.cnt >= $1
+          AND (t.sim_buy_iteration IS NOT NULL OR metrics.cnt < $4)
+        ORDER BY metrics.cnt ASC
+        LIMIT 200
+        """,
+        ENTRY_MIN_SECONDS,
+        list(GOOD_PATTERN_CODES),
+        MAX_TOKEN_AGE_SEC,
+        MAX_WAIT_ITERATIONS,
+    )
+    return [(int(r["id"]), int(r["cnt"])) for r in rows]
+
+
+async def _fetch_ids_needing_current(conn) -> List[int]:
+    rows = await conn.fetch(
+        """
+        SELECT id FROM tokens
+        WHERE history_ready = FALSE
+          AND sim_buy_token_amount IS NOT NULL
+          AND sim_sell_iteration IS NULL
+        LIMIT 500
+        """
+    )
+    return [r["id"] for r in rows]
+
+
+async def _recommend_entry_amount(conn, token_id: int) -> float:
+    try:
+        base_amount = float(getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.0))
+    except Exception:
+        base_amount = 5.0
+    try:
+        tok = await conn.fetchrow(
+            "SELECT liquidity, mcap FROM tokens WHERE id=$1",
+            token_id
+        )
+    except Exception:
+        tok = None
+
+    if tok:
+        liq_val = tok["liquidity"]
+        mcap_val = tok["mcap"]
+        liquidity = float(liq_val) if liq_val is not None else 0.0
+        mcap = float(mcap_val) if mcap_val is not None else 0.0
+    else:
+        liquidity = 0.0
+        mcap = 0.0
+
+    if liquidity <= 0:
+        liquidity_cap = 10.0
+    elif liquidity < 15000:
+        liquidity_cap = 10.0
+    elif liquidity < 50000:
+        liquidity_cap = 20.0
+    elif liquidity < 150000:
+        liquidity_cap = 40.0
+    elif liquidity < 500000:
+        liquidity_cap = 60.0
+    else:
+        liquidity_cap = 100.0
+
+    mcap_cap = base_amount if mcap <= 0 else max(base_amount, min(100.0, mcap * 0.00005))
+
+    trade_cap = liquidity_cap
+    try:
+        stats = await conn.fetchrow(
+            """
+            WITH latest AS (
+              SELECT COALESCE(MAX(ts), 0) AS max_ts
+              FROM token_metrics_seconds
+              WHERE token_id=$1 AND usd_price IS NOT NULL AND usd_price>0
+            )
+            SELECT
+              COALESCE(SUM(buy_usd), 0) AS sum_buy_usd,
+              COALESCE(SUM(buy_count), 0) AS sum_buy_count,
+              COALESCE(AVG(median_amount_usd), 0) AS avg_median_usd
+            FROM token_metrics_seconds
+            WHERE token_id=$1
+              AND usd_price IS NOT NULL AND usd_price>0
+              AND ts >= (SELECT max_ts FROM latest) - 60
+              AND ts <= (SELECT max_ts FROM latest)
+            """,
+            token_id
+        )
+    except Exception:
+        stats = None
+
+    if stats:
+        sum_buy_usd = float(stats["sum_buy_usd"] or 0.0)
+        sum_buy_count = float(stats["sum_buy_count"] or 0.0)
+        avg_median = float(stats["avg_median_usd"] or 0.0)
+        avg_buy = sum_buy_usd / sum_buy_count if sum_buy_count > 0 else 0.0
+        if sum_buy_count < 3:
+            avg_buy *= 0.6
+        trade_cap_candidate = max(avg_buy, avg_median, base_amount)
+        trade_cap = max(base_amount, min(100.0, trade_cap_candidate))
+        if sum_buy_count < 3:
+            trade_cap = min(trade_cap, 20.0)
+    else:
+        trade_cap = liquidity_cap
+
+    limit = max(base_amount, min(liquidity_cap, mcap_cap, trade_cap))
+    for amt in CANDIDATE_AMOUNTS:
+        if limit >= amt:
+            return float(amt)
+    return base_amount
+
+
+async def _simulation_loop(interval_sec: float = 1.0):
+    pool = await get_db_pool()
+    while True:
+        try:
+            async with pool.acquire() as conn:
+                # 1) Legacy background auto-buys are disabled by default. Enable via config if needed.
+                if getattr(config, 'SIM_BACKGROUND_BUY_ENABLED', False):
+                    buy_candidates = await _fetch_ids_needing_buy(conn)
+                    for tid, iterations in buy_candidates:
+                        try:
+                            entry_iter = max(iterations, ENTRY_MIN_SECONDS)
+                            # Strict base amount (adaptive disabled by request)
+                            try:
+                                base_amount = float(getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.0))
+                            except Exception:
+                                base_amount = 5.0
+                            await sim_buy(tid, entry_sec=entry_iter, amount_usd=base_amount)
+                        except Exception:
+                            pass
+
+                # 2) Поточна вартість для всіх токенів з встановленим sim_buy
+                cur_ids = await _fetch_ids_needing_current(conn)
+                for tid in cur_ids:
+                    try:
+                        await sim_current(tid)
+                        await sim_sell(tid, target_mult=TARGET_MULT)
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            # не падаємо, просто наступна ітерація
+            pass
+        await asyncio.sleep(interval_sec)
+
+
+async def start_simulation_timer() -> bool:
+    """Запустити незалежний таймер симуляції (buy @ 30s + поточна вартість)."""
+    global _sim_task
+    if _sim_task and not _sim_task.done():
+        return False
+    _sim_task = asyncio.create_task(_simulation_loop())
+    return True
+
+
+async def stop_simulation_timer() -> bool:
+    global _sim_task
+    if not _sim_task:
+        return False
+    _sim_task.cancel()
+    try:
+        await _sim_task
+    except asyncio.CancelledError:
+        pass
+    _sim_task = None
+    return True
+
+
+# =====================
+# Centralized token sale finalization
+# =====================
+
+async def finalize_token_sale(token_id: int, conn, reason: str = 'auto') -> bool:
+    """
+    Centralized function to finalize token sale:
+    - Free wallet (active_token_id=NULL, entry_amount_usd=NULL)
+    - Update wallet balance (cash_usd += realized, total_profit_usd += profit)
+    - Close wallet history (exit_* fields, profit, outcome)
+    - Clear tokens.sim_wallet_id = NULL
+    - Set tokens.history_ready = TRUE
+    
+    This function should be called by analyzer when sim_sell_iteration IS NOT NULL.
+    ETA and force_sell should only set sim_sell_* fields, then analyzer calls this.
+    
+    Args:
+        token_id: Token ID
+        conn: Database connection
+        reason: Reason for sale ('auto', 'manual', 'zero-liquidity', 'frozen')
+    
+    Returns:
+        True if finalized successfully, False otherwise
+    """
+    try:
+        # Get token data
+        row = await conn.fetchrow(
+            """
+            SELECT 
+                sim_wallet_id, 
+                sim_buy_token_amount, 
+                sim_buy_price_usd, 
+                sim_buy_iteration,
+                sim_sell_token_amount,
+                sim_sell_price_usd,
+                sim_sell_iteration
+            FROM tokens 
+            WHERE id=$1
+            """,
+            token_id
+        )
+        if not row:
+            return False
+        
+        wid = row["sim_wallet_id"]
+        if wid is None:
+            # No wallet attached - just mark history_ready
+        await conn.execute(
+            """
+                UPDATE tokens 
+                SET history_ready = TRUE,
+                    sim_wallet_id = NULL,
+              token_updated_at = CURRENT_TIMESTAMP
+            WHERE id=$1
+            """,
+                token_id
+        )
+            return True
+
+        # Get wallet data
+            w = await conn.fetchrow(
+                "SELECT entry_amount_usd, cash_usd FROM sim_wallets WHERE id=$1",
+                int(wid)
+            )
+        if not w:
+            return False
+        
+        # Calculate realized amount and profit
+        sell_amt = float(row["sim_sell_token_amount"] or row["sim_buy_token_amount"] or 0.0)
+        sell_price = float(row["sim_sell_price_usd"] or 0.0)
+        buy_price = float(row["sim_buy_price_usd"] or 0.0)
+        buy_iter = int(row["sim_buy_iteration"]) if row["sim_buy_iteration"] is not None else 0
+        sell_iter = int(row["sim_sell_iteration"]) if row["sim_sell_iteration"] is not None else 0
+        
+            realized_base = sell_amt * sell_price
+        entry_amt = float(w["entry_amount_usd"] or getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.0))
+            deposit = float(getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.0))
+            scale = (entry_amt / deposit) if deposit > 0 else 1.0
+            realized = float(realized_base * scale)
+        
+        # Apply fees
+            try:
+                sl_bps = int(getattr(config, 'SIM_FEES_SLIPPAGE_BPS', 250))
+                jup_bps = int(getattr(config, 'SIM_FEES_JUPITER_BPS', 0))
+                bps_rate = float(max(0, sl_bps + jup_bps)) / 10000.0
+            except Exception:
+                bps_rate = 0.0
+            try:
+                sol_fee = float(getattr(config, 'SIM_FEES_SOL_PER_TX', 0.000005))
+                sol_price = float(getattr(config, 'SOL_PRICE_FALLBACK', 193.0))
+                net_fee_usd = float(sol_fee) * float(sol_price)
+            except Exception:
+                net_fee_usd = 0.0
+        
+            fees = realized * bps_rate + net_fee_usd
+            realized = max(0.0, realized - fees)
+            profit_delta = float(realized - entry_amt)
+        
+        # Update wallet: free it and update balance
+        # NOTE: entry_amount_usd is preserved as user preference (not cleared after sale)
+        # It will be used for the next buy. Only active_token_id is cleared.
+            await conn.execute(
+                """
+                UPDATE sim_wallets
+                SET cash_usd = cash_usd + $2,
+                    active_token_id = NULL,
+                -- entry_amount_usd: DO NOT CLEAR - preserve user-configured entry amount for next buy
+                total_profit_usd = COALESCE(total_profit_usd, 0) + $3,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id=$1
+                """,
+                int(wid), realized, profit_delta
+            )
+
+            # Update wallet history with exit and outcome
+            try:
+                pct = (profit_delta / entry_amt) if entry_amt > 0 else 0.0
+                try:
+                    target = float(getattr(config, 'TARGET_RETURN', 0.13))
+                except Exception:
+                    target = 0.13
+            
+                if sell_price <= 0.0:
+                    outcome = 'frozen'
+                elif pct >= target:
+                    outcome = 'good'
+                elif pct > 0:
+                    outcome = 'medium'
+                else:
+                    outcome = 'bad'
+            
+            # Update exit fields (commission data may already be set by force_sell for real trading)
+            # For simulation mode, commission data will be NULL
+                await conn.execute(
+                    """
+                    UPDATE sim_wallet_history
+                SET exit_amount_usd=COALESCE(exit_amount_usd, $3),
+                    exit_token_amount=COALESCE(exit_token_amount, $4),
+                    exit_price_usd=COALESCE(exit_price_usd, $5),
+                    exit_iteration=COALESCE(exit_iteration, $6),
+                        profit_usd=$7,
+                        profit_pct=$8,
+                        outcome=$9,
+                    reason=COALESCE(reason, $10),
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE token_id=$1 AND wallet_id=$2 AND exit_iteration IS NULL
+                    """,
+                    token_id, int(wid),
+                realized, sell_amt, sell_price, sell_iter,
+                profit_delta, pct, outcome, reason
+                )
+            except Exception:
+                pass
+        
+        # Finalize token: clear wallet reference and mark history_ready
+        await conn.execute(
+            """
+            UPDATE tokens 
+            SET history_ready = TRUE,
+                sim_wallet_id = NULL,
+                token_updated_at = CURRENT_TIMESTAMP
+            WHERE id=$1
+            """,
+            token_id
+        )
+        
+        return True
+    except Exception as e:
+        # print(f"[finalize_token_sale] Error for token_id={token_id}: {e}")
+        return False
+
+
+# =====================
+# Force actions (used by HTTP endpoints)
+# =====================
+
+# ============================================================================
+# HELPER FUNCTIONS (SHARED by all modes)
+# ============================================================================
+
+async def _get_iteration_number(conn, token_id: int) -> int:
+    """Get current iteration number (count of seconds with valid price)."""
+    rn = await conn.fetchval(
+        "SELECT COUNT(*) FROM token_metrics_seconds WHERE token_id=$1 AND usd_price IS NOT NULL AND usd_price > 0",
+        token_id
+    )
+    return int(rn or 0)
+
+
+async def _get_current_price(conn, token_id: int) -> float:
+    """Get current token price from tokens.usd_price or token_metrics_seconds."""
+    # Priority 1: Get from tokens.usd_price (fastest)
+    tok = await conn.fetchrow("SELECT usd_price FROM tokens WHERE id=$1", token_id)
+    if tok and tok["usd_price"] and float(tok["usd_price"]) > 0:
+        return float(tok["usd_price"])
+    
+    # Priority 2: Get from token_metrics_seconds (latest)
+    latest = await conn.fetchrow(
+        """SELECT usd_price FROM token_metrics_seconds 
+           WHERE token_id=$1 AND usd_price IS NOT NULL AND usd_price > 0
+           ORDER BY ts DESC LIMIT 1""",
+        token_id
+    )
+    if latest and latest["usd_price"]:
+        return float(latest["usd_price"])
+    
+    return 0.0
+
+
+# ============================================================================
+# FORCE BUY - REAL TRADING MODE
+# ============================================================================
+
+async def force_buy_real(token_id: int) -> dict:
+    """Manual force buy in REAL mode.
+    
+    Flow:
+    1. Get free real wallet
+    2. Get current price
+    3. Execute advanced real buy (honeypot check + sell sim + real buy)
+    4. UPDATE tokens: sim_buy_*, real_wallet_id
+    5. UPDATE sim_wallets: active_token_id (bind)
+    6. INSERT sim_wallet_history with ALL commission details
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        # Get token info
+        token_row = await conn.fetchrow(
+            "SELECT sim_buy_iteration, real_wallet_id, token_address, decimals FROM tokens WHERE id=$1",
+            token_id
+        )
+        if not token_row:
+            return {"success": False, "message": "Token not found"}
+        
+        # Check if already entered
+        if token_row["sim_buy_iteration"] is not None:
+            return {"success": True, "message": "already entered", "token_id": token_id}
+
+        token_address = token_row["token_address"]
+        token_decimals = int(token_row["decimals"]) if token_row["decimals"] is not None else 6
+        
+        # Find free real wallet
+        wallet_info = await get_free_wallet(conn)
+        if not wallet_info:
+            return {"success": False, "message": "No free real wallets available"}
+        
+        keypair = wallet_info["keypair"]
+        key_id = wallet_info["key_id"]
+        
+        # Get price
+        price_now = await _get_current_price(conn, token_id)
+        if price_now <= 0:
+            return {"success": False, "message": "Cannot buy: token price is zero or unavailable"}
+        
+        # Get iteration number
+        rn = await _get_iteration_number(conn, token_id)
+        
+        # Get entry_amount from wallet (user-configured per wallet)
+        wallet_row = await conn.fetchrow(
+            "SELECT entry_amount_usd, cash_usd FROM sim_wallets WHERE id=$1",
+            key_id
+        )
+        if wallet_row:
+            if wallet_row["entry_amount_usd"] is not None and float(wallet_row["entry_amount_usd"]) > 0:
+                base_usd = float(wallet_row["entry_amount_usd"])
+            else:
+                try:
+                    base_usd = float(getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.0))
+                except Exception:
+                    base_usd = 5.0
+            
+            # Check if wallet has enough cash
+            cash_available = float(wallet_row["cash_usd"] or 0.0)
+            if cash_available < base_usd:
+                return {"success": False, "message": f"Insufficient wallet balance: ${cash_available:.2f} < ${base_usd:.2f}"}
+        else:
+            try:
+                base_usd = float(getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.0))
+            except Exception:
+                base_usd = 5.0
+        
+        # Execute advanced real buy (with honeypot check via sell simulation)
+        buy_result = await execute_advanced_buy(token_id, keypair, base_usd, token_address, token_decimals)
+        
+        if not buy_result.get("success"):
+            return buy_result
+        
+        # Save to database
+        amount_tokens = buy_result["amount_tokens"]
+        price_actual = buy_result["price_usd"]
+        
+        # Plan sell
+        try:
+            target_ret = float(getattr(config, 'TARGET_RETURN', 0.15))
+        except Exception:
+            target_ret = 0.15
+        try:
+            eta_rel = int(getattr(config, 'ETA_REL_CAP', 15))
+        except Exception:
+            eta_rel = 15
+        plan_price = float(price_actual * (1.0 + target_ret))
+        plan_iter = int(rn + eta_rel)
+        
+        await conn.execute(
+            """
+            UPDATE tokens SET
+              sim_buy_token_amount=$2,
+              sim_buy_price_usd=$3,
+              sim_buy_iteration=$4,
+              sim_sell_token_amount=COALESCE(sim_sell_token_amount, $2),
+              sim_plan_sell_price_usd=$5,
+              sim_plan_sell_iteration=$6,
+              real_wallet_id=$7,
+              token_updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1
+            """,
+            token_id, amount_tokens, price_actual, rn, plan_price, plan_iter, key_id
+        )
+        
+        # Update wallet to bind it to this token
+        await conn.execute(
+            """
+            UPDATE sim_wallets
+            SET active_token_id=$2,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1 AND active_token_id IS NULL
+            """,
+            key_id, token_id
+        )
+        
+        # Create journal entry with transaction details
+        try:
+            await conn.execute(
+                """
+                INSERT INTO sim_wallet_history(
+                    wallet_id, token_id,
+                    entry_amount_usd, entry_token_amount, entry_price_usd, entry_iteration,
+                    entry_slippage_bps, entry_slippage_pct, entry_price_impact_pct,
+                    entry_transaction_fee_sol, entry_transaction_fee_usd,
+                    entry_expected_amount_usd, entry_actual_amount_usd,
+                    entry_signature,
+                    outcome, reason, created_at, updated_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'','manual',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                """,
+                key_id, token_id,
+                base_usd, amount_tokens, price_actual, rn,
+                buy_result.get("slippage_bps"),
+                buy_result.get("slippage_pct"),
+                buy_result.get("price_impact_pct"),
+                buy_result.get("transaction_fee_sol"),
+                buy_result.get("transaction_fee_usd"),
+                buy_result.get("expected_amount_usd"),
+                buy_result.get("actual_amount_usd"),
+                buy_result.get("signature")
+            )
+        except Exception:
+            pass
+        
+        return {
+            "success": True,
+            "token_id": token_id,
+            "iteration": rn,
+            "price": price_actual,
+            "wallet_key_id": key_id,
+            "signature": buy_result.get("signature"),
+            "mode": "real",
+            "slippage_bps": buy_result.get("slippage_bps"),
+            "price_impact_pct": buy_result.get("price_impact_pct"),
+            "transaction_fee_usd": buy_result.get("transaction_fee_usd")
+        }
+
+
+# ============================================================================
+# FORCE BUY - SIMULATION MODE
+# ============================================================================
+
+async def force_buy_simulation(token_id: int) -> dict:
+    """Manual force buy in SIMULATION mode.
+    
+    Flow:
+    1. Get free virtual wallet
+    2. Get current price
+    3. Get current iteration (rn)
+    4. Calculate fees & deduct from cash
+    5. UPDATE tokens: sim_buy_*, sim_wallet_id
+    6. UPDATE sim_wallets: active_token_id, deduct cash
+    7. INSERT sim_wallet_history (entry_*)
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        # Ensure sim_wallets are initialized if empty
+        try:
+            cnt = await conn.fetchval("SELECT COUNT(*) FROM sim_wallets")
+        except Exception:
+            cnt = 0
+        if int(cnt or 0) == 0:
+            try:
+                wallets = int(getattr(config, 'VIRTUAL_WALLETS_COUNT', 5))
+            except Exception:
+                wallets = 5
+            try:
+                init_val = float(getattr(config, 'VIRTUAL_WALLET_INITIAL_USD', getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.5)))
+            except Exception:
+                init_val = 5.5
+            for i in range(1, max(1, wallets) + 1):
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO sim_wallets(id, name, initial_deposit_usd, cash_usd, updated_at)
+                        VALUES($1, $2, $3, $3, CURRENT_TIMESTAMP)
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        i, f"Wallet {i}", init_val
+                    )
+                except Exception:
+                    pass
+        
+        # Get token info
+        token_row = await conn.fetchrow(
+            "SELECT sim_buy_iteration, real_wallet_id, token_address, decimals FROM tokens WHERE id=$1",
+            token_id
+        )
+        if not token_row:
+            return {"success": False, "message": "Token not found"}
+        
+        # Check if already entered
+        if token_row["sim_buy_iteration"] is not None:
+            return {"success": True, "message": "already entered", "token_id": token_id}
+
+        # Get price
+        price_now = await _get_current_price(conn, token_id)
+        if price_now <= 0:
+            return {"success": False, "message": "Cannot buy: token price is zero or unavailable"}
+
+        # Get iteration number
+        rn = await _get_iteration_number(conn, token_id)
+        
+        # Get entry_amount from wallet (user-configured per wallet)
+        w = await conn.fetchrow(
+            "SELECT id, cash_usd, entry_amount_usd FROM sim_wallets WHERE active_token_id IS NULL ORDER BY id ASC LIMIT 1"
+        )
+        if not w:
+            return {"success": False, "message": "No free wallets available"}
+        
+        # Use wallet's entry_amount_usd if set, otherwise fallback to config
+        if w["entry_amount_usd"] is not None and float(w["entry_amount_usd"]) > 0:
+            base_usd = float(w["entry_amount_usd"])
+        else:
+            try:
+                base_usd = float(getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.0))
+            except Exception:
+                base_usd = 5.0
+
+        # Check if wallet has enough cash
+        cash_available = float(w["cash_usd"] or 0.0)
+        if cash_available < base_usd:
+            return {"success": False, "message": f"Insufficient wallet balance: ${cash_available:.2f} < ${base_usd:.2f}"}
+        
+        wid = int(w['id'])
+        cash = float(w['cash_usd'] or 0.0)
+        if cash <= 0:
+            return {"success": False, "message": "Wallet has no cash"}
+
+        # Calculate fees
+        try:
+            bps = (int(getattr(config, 'SIM_FEES_SLIPPAGE_BPS', 250)) + int(getattr(config, 'SIM_FEES_JUPITER_BPS', 0))) / 10000.0
+        except Exception:
+            bps = 0.0
+        try:
+            sol_fee = float(getattr(config, 'SIM_FEES_SOL_PER_TX', 0.000005))
+            sol_price = float(getattr(config, 'SOL_PRICE_FALLBACK', 193.0))
+            net_fee = sol_fee * sol_price
+        except Exception:
+            net_fee = 0.0
+
+        max_base = max(0.0, (cash - net_fee) / (1.0 + bps)) if (1.0 + bps) > 0 else 0.0
+        entry_base = min(base_usd, max_base)
+        if entry_base <= 0:
+            return {"success": False, "message": "Insufficient cash after fees"}
+        total_cost = entry_base * (1.0 + bps) + net_fee
+        amount_tokens = float(entry_base / price_now) if price_now > 0 else 0.0
+
+        # Plan sell
+        try:
+            target_ret = float(getattr(config, 'TARGET_RETURN', 0.15))
+        except Exception:
+            target_ret = 0.15
+        try:
+            eta_rel = int(getattr(config, 'ETA_REL_CAP', 15))
+        except Exception:
+            eta_rel = 15
+        plan_price = float(price_now * (1.0 + target_ret))
+        plan_iter = int(rn + eta_rel)
+
+        await conn.execute(
+            """
+            UPDATE tokens SET
+              sim_buy_token_amount=$2,
+              sim_buy_price_usd=$3,
+              sim_buy_iteration=$4,
+              sim_sell_token_amount=COALESCE(sim_sell_token_amount, $2),
+              sim_plan_sell_price_usd=$5,
+              sim_plan_sell_iteration=$6,
+              sim_wallet_id=$7,
+              token_updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1
+            """,
+            token_id, amount_tokens, price_now, rn, plan_price, plan_iter, wid
+        )
+
+        # Update wallet atomically - check if still free and update
+        wallet_update_result = await conn.execute(
+            """
+            UPDATE sim_wallets
+            SET active_token_id=$2,
+                entry_amount_usd=$3,
+                cash_usd=GREATEST(cash_usd - $4::numeric, 0::numeric),
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1 AND active_token_id IS NULL
+            """,
+            wid, token_id, entry_base, total_cost
+        )
+        
+        # Extract number of affected rows
+        try:
+            affected_rows = int(wallet_update_result.split()[-1]) if wallet_update_result else 0
+        except Exception:
+            affected_rows = 0
+        
+        # If wallet was already taken by another transaction, fail
+        if affected_rows == 0:
+            return {"success": False, "message": "Wallet was taken by another transaction or not found. Please try again."}
+
+        # Write wallet history (open position)
+        try:
+            await conn.execute(
+                """
+                INSERT INTO sim_wallet_history(
+                    wallet_id, token_id,
+                    entry_amount_usd, entry_token_amount, entry_price_usd, entry_iteration,
+                    outcome, reason, created_at, updated_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,'', 'manual', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                wid, token_id, entry_base, amount_tokens, price_now, rn
+            )
+        except Exception:
+            pass
+
+        return {"success": True, "token_id": token_id, "iteration": rn, "price": price_now, "wallet_id": wid}
+
+
+# ============================================================================
+# FORCE BUY - ROUTER
+# ============================================================================
+
+async def force_buy(token_id: int) -> dict:
+    """Router: selects force_buy_real or force_buy_simulation based on config"""
+    real_trading = getattr(config, 'REAL_TRADING_ENABLED', False)
+    if real_trading:
+        return await force_buy_real(token_id)
+    else:
+        return await force_buy_simulation(token_id)
+
+
+# ============================================================================
+# FORCE SELL - REAL TRADING MODE
+# ============================================================================
+
+async def force_sell_real(token_id: int) -> dict:
+    """Force-immediate sell. If no entry yet — purge token entirely.
+    Otherwise set sim_sell_* at last price (0 if missing), apply fees to wallet and close.
+    
+    Supports both simulation mode (virtual wallets) and real trading mode (actual wallets).
+    Mode is controlled by config.REAL_TRADING_ENABLED.
+    """
+    # Check trading mode
+    real_trading = getattr(config, 'REAL_TRADING_ENABLED', False)
+    
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT sim_buy_token_amount, sim_buy_price_usd, sim_buy_iteration, sim_wallet_id,
+                   real_wallet_id, token_address, decimals
+            FROM tokens WHERE id=$1
+            """,
+            token_id
+        )
+        if not row:
+            return {"success": False, "message": "Token not found"}
+
+        if row["sim_buy_iteration"] is None:
+            # Purge token completely
+            await conn.execute("DELETE FROM token_metrics_seconds WHERE token_id=$1", token_id)
+            await conn.execute("DELETE FROM trades WHERE token_id=$1", token_id)
+            await conn.execute("DELETE FROM tokens WHERE id=$1", token_id)
+            return {"success": True, "deleted": True, "token_id": token_id}
+        
+        # REAL TRADING MODE
+        if real_trading and row["real_wallet_id"] is not None:
+            # Load wallet keypair
+            key_id = int(row["real_wallet_id"])
+            try:
+                with open(config.WALLET_KEYS_FILE) as f:
+                    keys = json.load(f)
+            except Exception as e:
+                return {"success": False, "message": f"Failed to load keys.json: {str(e)}"}
+            
+            wallet_key = None
+            for k in keys:
+                if k.get("id") == key_id:
+                    wallet_key = k
+                    break
+            
+            if not wallet_key:
+                return {"success": False, "message": f"Wallet key_id={key_id} not found in keys.json"}
+            
+            try:
+                keypair = Keypair.from_bytes(bytes(wallet_key["bits"]))
+            except Exception as e:
+                return {"success": False, "message": f"Failed to load keypair: {str(e)}"}
+            
+            token_address = row["token_address"]
+            token_amount = float(row["sim_buy_token_amount"]) if row["sim_buy_token_amount"] else 0.0
+            token_decimals = int(row["decimals"]) if row["decimals"] is not None else 6
+            buy_price = float(row["sim_buy_price_usd"]) if row["sim_buy_price_usd"] else 0.0
+            
+            # Execute advanced real sell (with simulation and honeypot check)
+            min_price = buy_price * 0.8 if buy_price > 0 else None  # 80% safety
+            sell_result = await execute_advanced_sell(token_id, keypair, token_address, token_amount, token_decimals, min_price)
+            
+            if not sell_result.get("success"):
+                return sell_result
+            
+            # Get iteration number
+            rn = await conn.fetchval(
+                "SELECT COUNT(*) FROM token_metrics_seconds WHERE token_id=$1",
+                token_id
+            ) or 0
+            
+            # Update token (set sim_sell_* fields, clear real_wallet_id)
+            price_sold = sell_result["price_usd"]
+            await conn.execute(
+                """
+                UPDATE tokens SET 
+                  sim_sell_token_amount = COALESCE(sim_sell_token_amount, sim_buy_token_amount),
+                  sim_sell_price_usd = $2,
+                  sim_sell_iteration = $3,
+                  sim_plan_sell_price_usd = $2,
+                  sim_plan_sell_iteration = $3,
+                  real_wallet_id = NULL,
+                  token_updated_at = CURRENT_TIMESTAMP
+                WHERE id=$1
+                """,
+                token_id, price_sold, rn,
+            )
+            
+            # Store transaction details in sim_wallet_history immediately (for real trading)
+            # Update exit fields with commission data from real sell
+            try:
+                await conn.execute(
+                    """
+                    UPDATE sim_wallet_history
+                    SET exit_amount_usd=$3,
+                        exit_token_amount=COALESCE(exit_token_amount, $4),
+                        exit_price_usd=$5,
+                        exit_iteration=$6,
+                        exit_slippage_bps=$7,
+                        exit_slippage_pct=$8,
+                        exit_price_impact_pct=$9,
+                        exit_transaction_fee_sol=$10,
+                        exit_transaction_fee_usd=$11,
+                        exit_expected_amount_usd=$12,
+                        exit_actual_amount_usd=$13,
+                        exit_signature=$14,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE token_id=$1 AND wallet_id=$2 AND exit_iteration IS NULL
+                    """,
+                    token_id, key_id,
+                    sell_result.get("amount_usd"),
+                    token_amount,
+                    price_sold,
+                    rn,
+                    sell_result.get("slippage_bps"),
+                    sell_result.get("slippage_pct"),
+                    sell_result.get("price_impact_pct"),
+                    sell_result.get("transaction_fee_sol"),
+                    sell_result.get("transaction_fee_usd"),
+                    sell_result.get("expected_amount_usd"),
+                    sell_result.get("actual_amount_usd"),
+                    sell_result.get("signature")
+                )
+            except Exception as e:
+                # print(f"[force_sell] Failed to update journal with exit commission data: {e}")
+                pass
+            
+            return {
+                "success": True,
+                "token_id": token_id,
+                "iteration": rn,
+                "price": price_sold,
+                "signature": sell_result.get("signature"),
+                "amount_sol": sell_result.get("amount_sol"),
+                "amount_usd": sell_result.get("amount_usd"),
+                "mode": "real",
+                "slippage_bps": sell_result.get("slippage_bps"),
+                "price_impact_pct": sell_result.get("price_impact_pct"),
+                "transaction_fee_usd": sell_result.get("transaction_fee_usd")
+            }
+        
+        # SIMULATION MODE: FORCE SELL: No restrictions. Get price from tokens.usd_price first, then metrics.
+        price_now = 0.0
+        rn = 0
+
+        # Priority 1: Get price from tokens.usd_price (fastest, always available)
+        tok = await conn.fetchrow("SELECT usd_price FROM tokens WHERE id=$1", token_id)
+        if tok and tok["usd_price"] and float(tok["usd_price"]) > 0:
+            price_now = float(tok["usd_price"]) or 0.0
+
+        # Priority 2: Try to get iteration number and better price from token_metrics_seconds
+        last = await conn.fetchrow(
+            """
+            WITH o AS (
+              SELECT row_number() OVER (ORDER BY ts ASC) AS rn, usd_price
+              FROM token_metrics_seconds
+              WHERE token_id=$1
+              ORDER BY ts ASC
+            )
+            SELECT rn, usd_price FROM o ORDER BY rn DESC LIMIT 1
+            """,
+            token_id,
+        )
+        if last:
+            rn = int(last["rn"]) if last["rn"] is not None else 0
+            if last["usd_price"] and float(last["usd_price"]) > 0:
+                price_now = float(last["usd_price"]) or price_now
+        else:
+            # No metrics - use current count
+            rn = await conn.fetchval(
+                "SELECT COUNT(*) FROM token_metrics_seconds WHERE token_id=$1",
+                token_id
+            ) or 0
+
+        # If no price found, use 0 (allow selling even if price unavailable - manual decision)
+
+        # FORCE SELL: Only set sim_sell_* fields. Analyzer will call finalize_token_sale() on next tick.
+        await conn.execute(
+            """
+            UPDATE tokens SET 
+              sim_sell_token_amount = COALESCE(sim_sell_token_amount, sim_buy_token_amount),
+              sim_sell_price_usd = $2,
+              sim_sell_iteration = $3,
+              sim_plan_sell_price_usd = $2,
+              sim_plan_sell_iteration = $3,
+              token_updated_at = CURRENT_TIMESTAMP
+            WHERE id=$1
+            """,
+            token_id, price_now, rn,
+        )
+
+        return {"success": True, "token_id": token_id, "iteration": rn, "price": price_now}
+
+
+async def execute_advanced_buy(token_id: int, keypair: Keypair, amount_usd: float, token_address: str, token_decimals: int) -> Dict:
+    """Advanced real buy with honeypot detection via sell simulation.
+    
+    Algorithm:
+    1. Simulate a sell transaction to detect honeypot (if sell fails → honeypot)
+    2. If simulation passes → execute real buy
+    3. Collect all commission/slippage data
+    
+    Note: Does NOT check mint/freeze authority fields (they may be incorrectly populated)
+    """
+    import random
+    MAX_RETRIES = 3
+    RETRY_DELAY = (1, 3)
+    SAFE_SLIPPAGE_BPS = 200  # 2%
+    
+    try:
+        sol_price = await get_sol_price()
+        if sol_price <= 0:
+            return {"success": False, "message": "Failed to get SOL price"}
+        
+        # STEP 1: Simulate a small sell to detect honeypot
+        # If we can't simulate selling, it's likely a honeypot
+        test_sell_amount = 1000 * (10**token_decimals)  # Small test amount
+        
+        # Use async HTTP session for non-blocking requests
+        session = await get_http_session()
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Get test sell quote (async, non-blocking)
+                async with session.get(f"{JUP}/quote", params={
+                    "inputMint": token_address,
+                    "outputMint": SOL_MINT,
+                    "amount": test_sell_amount,
+                    "slippageBps": 50
+                }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    test_quote = await resp.json()
+                
+                if "error" in test_quote:
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(random.uniform(*RETRY_DELAY))
+                        continue
+                    return {"success": False, "message": f"Honeypot detected: cannot get sell quote: {test_quote.get('error', 'Unknown')}"}
+                
+                # Build swap transaction for simulation (async, non-blocking)
+                async with session.post(f"{JUP}/swap", json={
+                    "quoteResponse": test_quote,
+                    "userPublicKey": "11111111111111111111111111111111",  # Dummy pubkey for simulation
+                    "computeUnitPriceMicroLamports": 10000
+                }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    swap_res = await resp.json()
+                
+                if "error" in swap_res:
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(random.uniform(*RETRY_DELAY))
+                        continue
+                    return {"success": False, "message": f"Honeypot detected: cannot build sell swap: {swap_res.get('error', 'Unknown')}"}
+                
+                swap_tx = swap_res.get("swapTransaction")
+                if not swap_tx:
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(random.uniform(*RETRY_DELAY))
+                        continue
+                    return {"success": False, "message": "Honeypot detected: no swap transaction returned"}
+                
+                # Simulate transaction (async, non-blocking)
+                tx_bytes = base64.b64decode(swap_tx)
+                tx_base64 = base64.b64encode(tx_bytes).decode()
+                
+                simulate_payload = {
+                    "jsonrpc": "2.0",
+                    "id": "1",
+                    "method": "simulateTransaction",
+                    "params": [
+                        tx_base64,
+                        {
+                            "encoding": "base64",
+                            "commitment": "confirmed",
+                            "sigVerify": False,
+                            "replaceRecentBlockhash": True
+                        }
+                    ]
+                }
+                
+                async with session.post(RPC, json=simulate_payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    sim_res = await resp.json()
+                if "error" in sim_res:
+                    error_msg = sim_res["error"].get("message", "Unknown")
+                    # If simulation fails → likely honeypot
+                    return {
+                        "success": False,
+                        "message": f"Honeypot detected: sell simulation failed: {error_msg}",
+                        "simulation_error": error_msg
+                    }
+                
+                # Simulation passed → not a honeypot, proceed with buy
+                break
+                
+            except Exception as e:
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(random.uniform(*RETRY_DELAY))
+                    continue
+                return {"success": False, "message": f"Honeypot check failed: {str(e)}"}
+        
+        # STEP 2: Execute real buy (honeypot check passed)
+        buy_result = await execute_buy(token_id, keypair, amount_usd, token_address, token_decimals)
+        
+        if not buy_result.get("success"):
+            return buy_result
+        
+        # Return all data including transaction details
+        return buy_result
+        
+    except Exception as e:
+        return {"success": False, "message": f"Exception in advanced buy: {str(e)}"}
+
+
+async def execute_advanced_sell(token_id: int, keypair: Keypair, token_address: str, token_amount: float, token_decimals: int, min_price_usd: float = None) -> Dict:
+    """Advanced real sell with transaction simulation.
+    
+    Algorithm:
+    1. Simulate transaction before execution
+    2. If simulation passes → execute real sell
+    3. Collect all commission/slippage data
+    """
+    import random
+    MAX_RETRIES = 3
+    RETRY_DELAY = (1, 3)
+    SAFE_SLIPPAGE_BPS = 200  # 2%
+    
+    try:
+        sol_price = await get_sol_price()
+        if sol_price <= 0:
+            return {"success": False, "message": "Failed to get SOL price"}
+        
+        # Use async HTTP session for non-blocking requests
+        session = await get_http_session()
+        
+        # Get current token price (async, non-blocking)
+        test_amount = 1000 * (10**token_decimals)
+        async with session.get(f"{JUP}/quote", params={
+            "inputMint": token_address,
+            "outputMint": SOL_MINT,
+            "amount": test_amount,
+            "slippageBps": 50
+        }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            q_test = await resp.json()
+        
+        if "error" in q_test:
+            return {"success": False, "message": f"Price check error: {q_test.get('error', 'Unknown')}"}
+        
+        sol_out = int(q_test["outAmount"]) / (10**SOL_DECIMALS)
+        token_price_usd = (sol_out / 1000) * sol_price
+        
+        # Validate minimum price
+        if min_price_usd and token_price_usd < min_price_usd:
+            return {
+                "success": False,
+                "message": f"Current price (${token_price_usd:.8f}) below minimum (${min_price_usd:.8f})",
+                "current_price": token_price_usd,
+                "min_price": min_price_usd
+            }
+        
+        # CRITICAL: Get REAL token balance from wallet (not from DB)
+        # DB value may be incorrect due to rounding or other issues
+        real_token_balance = await get_token_balance(keypair, token_address, token_decimals)
+        
+        if real_token_balance <= 0:
+            return {"success": False, "message": f"No tokens in wallet (balance: {real_token_balance})"}
+        
+        # Determine actual sell amount:
+        # 1. If DB amount is specified and is close to real balance (within 5%) → use DB amount
+        # 2. If DB amount is much less than real balance (< 90%) → use DB amount (partial sell)
+        # 3. Otherwise → use real balance (sell all available)
+        if token_amount > 0:
+            # Check if DB amount is close to real balance (within 5% tolerance)
+            if abs(token_amount - real_token_balance) / real_token_balance <= 0.05:
+                # DB amount is close to real balance - use DB amount (preserves user intent)
+                actual_sell_amount = token_amount
+            elif token_amount < real_token_balance * 0.9:
+                # DB amount is much less - user wants partial sell
+                actual_sell_amount = token_amount
+            else:
+                # DB amount is more than real balance or close - use real balance
+                actual_sell_amount = real_token_balance
+        else:
+            # No DB amount specified - use real balance (sell all)
+            actual_sell_amount = real_token_balance
+        
+        # Ensure we don't try to sell more than we have
+        actual_sell_amount = min(actual_sell_amount, real_token_balance)
+        
+        if actual_sell_amount <= 0:
+            return {"success": False, "message": f"Calculated sell amount is zero (balance: {real_token_balance}, requested: {token_amount})"}
+        
+        # Calculate amount to sell using REAL balance
+        raw_amount = int(actual_sell_amount * (10**token_decimals))
+        
+        # Get quote (async, non-blocking, single attempt for speed)
+        quote = None
+        try:
+            async with session.get(f"{JUP}/quote", params={
+                "inputMint": token_address,
+                "outputMint": SOL_MINT,
+                "amount": raw_amount,
+                "slippageBps": SAFE_SLIPPAGE_BPS
+            }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                quote = await resp.json()
+        except Exception as e:
+            return {"success": False, "message": f"Failed to get quote: {str(e)}"}
+        
+        if not quote or "error" in quote:
+            return {"success": False, "message": f"Quote error: {quote.get('error', 'Unknown') if quote else 'No quote'}"}
+        
+        # STEP 1: Simulate transaction before execution (async, non-blocking)
+        try:
+            async with session.post(f"{JUP}/swap", json={
+                "quoteResponse": quote,
+                "userPublicKey": "11111111111111111111111111111111",  # Dummy pubkey for simulation
+                "computeUnitPriceMicroLamports": 10000
+            }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                swap_res = await resp.json()
+            
+            if "error" not in swap_res:
+                swap_tx = swap_res.get("swapTransaction")
+                if swap_tx:
+                    tx_bytes = base64.b64decode(swap_tx)
+                    tx_base64 = base64.b64encode(tx_bytes).decode()
+                    
+                    simulate_payload = {
+                        "jsonrpc": "2.0",
+                        "id": "1",
+                        "method": "simulateTransaction",
+                        "params": [
+                            tx_base64,
+                            {
+                                "encoding": "base64",
+                                "commitment": "confirmed",
+                                "sigVerify": False,
+                                "replaceRecentBlockhash": True
+                            }
+                        ]
+                    }
+                    
+                    async with session.post(RPC, json=simulate_payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        sim_res = await resp.json()
+                    if "error" in sim_res:
+                        error_msg = sim_res["error"].get("message", "Unknown simulation error")
+                        return {
+                            "success": False,
+                            "message": f"Transaction simulation failed: {error_msg}",
+                            "simulation_error": error_msg
+                        }
+        except Exception as e:
+            # If simulation fails, log but continue (optional safety check)
+            pass
+        
+        # STEP 2: Execute real sell (simulation passed)
+        sell_result = await execute_sell(token_id, keypair, token_address, token_amount, token_decimals, min_price_usd)
+        
+        if not sell_result.get("success"):
+            return sell_result
+        
+        # Return all data including transaction details
+        return sell_result
+        
+    except Exception as e:
+        return {"success": False, "message": f"Exception in advanced sell: {str(e)}"}
+
+
+async def advanced_force_sell(token_id: int, min_price_usd: float = None) -> dict:
+    """Advanced force sell with protection against front-running.
+    
+    Features:
+    - Checks current token price via Jupiter API
+    - Validates price is above minimum threshold (if provided)
+    - Simulates transaction before execution
+    - Uses safe slippage (2%) and priority fee
+    
+    Args:
+        token_id: Token ID to sell
+        min_price_usd: Minimum price threshold (if None, uses buy price * 0.8 as safety)
+    
+    Returns:
+        dict with success status and details
+    """
+    import random
+    import time
+    
+    MAX_RETRIES = 5
+    RETRY_DELAY = (2, 5)
+    SAFE_SLIPPAGE_BPS = 200  # 2% slippage
+    PRIORITY_FEE = 10000  # microLamports
+    
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT 
+                sim_buy_token_amount, sim_buy_price_usd, sim_buy_iteration, sim_wallet_id,
+                token_address, usd_price, decimals
+            FROM tokens WHERE id=$1
+            """,
+            token_id
+        )
+        if not row:
+            return {"success": False, "message": "Token not found"}
+        
+        if row["sim_buy_iteration"] is None:
+            # No entry - just delete token
+            await conn.execute("DELETE FROM token_metrics_seconds WHERE token_id=$1", token_id)
+            await conn.execute("DELETE FROM trades WHERE token_id=$1", token_id)
+            await conn.execute("DELETE FROM tokens WHERE id=$1", token_id)
+            return {"success": True, "deleted": True, "token_id": token_id}
+        
+        token_address = row["token_address"]
+        buy_price = float(row["sim_buy_price_usd"]) if row["sim_buy_price_usd"] else 0.0
+        buy_amount = float(row["sim_buy_token_amount"]) if row["sim_buy_token_amount"] else 0.0
+        token_decimals = int(row["decimals"]) if row["decimals"] is not None else 6  # Default to 6 if not set
+        
+        # If min_price not provided, use 80% of buy price as safety threshold
+        if min_price_usd is None:
+            min_price_usd = buy_price * 0.8 if buy_price > 0 else 0.0
+        
+        # Get SOL price
+        sol_price = await get_sol_price()
+        if sol_price <= 0:
+            return {"success": False, "message": "Failed to get SOL price"}
+        
+        # Use async HTTP session for non-blocking requests
+        session = await get_http_session()
+        
+        # Check current token price via Jupiter API (async, non-blocking, single attempt for speed)
+        test_amount = 1000 * (10**token_decimals)  # Use actual token decimals
+        try:
+            async with session.get(f"{JUP}/quote", params={
+                "inputMint": token_address,
+                "outputMint": SOL_MINT,
+                "amount": test_amount,
+                "slippageBps": 50
+            }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                quote = await resp.json()
+        except Exception as e:
+            return {"success": False, "message": f"Failed to get quote: {str(e)}"}
+        
+        if not quote or "error" in quote:
+            return {"success": False, "message": "Failed to get token price from Jupiter API"}
+        
+        sol_out = int(quote["outAmount"]) / (10**SOL_DECIMALS)
+        token_price_usd = (sol_out / 1000) * sol_price
+        
+        # Validate minimum price
+        if token_price_usd < min_price_usd:
+            return {
+                "success": False,
+                "message": f"Current price (${token_price_usd:.8f}) is below minimum (${min_price_usd:.8f})",
+                "current_price": token_price_usd,
+                "min_price": min_price_usd
+            }
+        
+        # Calculate amount to sell
+        tokens_to_sell = buy_amount
+        raw_amount = int(tokens_to_sell * (10**token_decimals))  # Use actual token decimals
+        
+        # Get final quote with safe slippage (async, non-blocking, single attempt for speed)
+        try:
+            async with session.get(f"{JUP}/quote", params={
+                "inputMint": token_address,
+                "outputMint": SOL_MINT,
+                "amount": raw_amount,
+                "slippageBps": SAFE_SLIPPAGE_BPS
+            }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                final_quote = await resp.json()
+        except Exception as e:
+            return {"success": False, "message": f"Failed to get final quote: {str(e)}"}
+        
+        if not final_quote or "error" in final_quote:
+            return {"success": False, "message": "Failed to get final quote"}
+        
+        expected_sol = int(final_quote["outAmount"]) / (10**SOL_DECIMALS)
+        expected_usd = expected_sol * sol_price
+        
+        # Validate expected amount (should be at least buy_amount * (1 - slippage))
+        min_expected = buy_price * buy_amount * (1 - SAFE_SLIPPAGE_BPS / 10000)
+        if expected_usd < min_expected:
+            return {
+                "success": False,
+                "message": f"Expected amount (${expected_usd:.2f}) is below minimum (${min_expected:.2f})",
+                "expected_usd": expected_usd,
+                "min_expected": min_expected
+            }
+        
+        # Simulate transaction before finalizing (protection against front-running) - async, non-blocking
+        try:
+            # Build swap transaction for simulation
+            async with session.post(f"{JUP}/swap", json={
+                "quoteResponse": final_quote,
+                "userPublicKey": "11111111111111111111111111111111",  # Dummy pubkey for simulation
+                "computeUnitPriceMicroLamports": PRIORITY_FEE
+            }, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                swap_res = await resp.json()
+            
+            if "error" not in swap_res:
+                swap_tx = swap_res.get("swapTransaction")
+                if swap_tx:
+                    # Decode and simulate transaction
+                    tx_bytes = base64.b64decode(swap_tx)
+                    tx_base64 = base64.b64encode(tx_bytes).decode()
+                    
+                    # Simulate transaction via RPC (async, non-blocking)
+                    simulate_payload = {
+                        "jsonrpc": "2.0",
+                        "id": "1",
+                        "method": "simulateTransaction",
+                        "params": [
+                            tx_base64,
+                            {
+                                "encoding": "base64",
+                                "commitment": "confirmed",
+                                "sigVerify": False,
+                                "replaceRecentBlockhash": True
+                            }
+                        ]
+                    }
+                    
+                    async with session.post(RPC, json=simulate_payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        sim_res = await resp.json()
+                    if "error" in sim_res:
+                        error_msg = sim_res["error"].get("message", "Unknown simulation error")
+                        return {
+                            "success": False,
+                            "message": f"Transaction simulation failed: {error_msg}",
+                            "simulation_error": error_msg
+                        }
+        except Exception as e:
+            # If simulation fails, log but continue (optional safety check)
+            # In production, you might want to fail here, but for flexibility we continue
+            pass
+        
+        # Get iteration number
+        rn = 0
+        last = await conn.fetchrow(
+            """
+            WITH o AS (
+              SELECT row_number() OVER (ORDER BY ts ASC) AS rn, usd_price
+              FROM token_metrics_seconds
+              WHERE token_id=$1
+              ORDER BY ts ASC
+            )
+            SELECT rn, usd_price FROM o ORDER BY rn DESC LIMIT 1
+            """,
+            token_id,
+        )
+        if last:
+            rn = int(last["rn"]) if last["rn"] is not None else 0
+        else:
+            rn = await conn.fetchval(
+                "SELECT COUNT(*) FROM token_metrics_seconds WHERE token_id=$1",
+                token_id
+            ) or 0
+        
+        # ADVANCED FORCE SELL: Set sim_sell_* fields with validated price
+        # Analyzer will call finalize_token_sale() on next tick
+        await conn.execute(
+            """
+            UPDATE tokens SET 
+              sim_sell_token_amount = COALESCE(sim_sell_token_amount, sim_buy_token_amount),
+              sim_sell_price_usd = $2,
+              sim_sell_iteration = $3,
+              sim_plan_sell_price_usd = $2,
+              sim_plan_sell_iteration = $3,
+              token_updated_at = CURRENT_TIMESTAMP
+            WHERE id=$1
+            """,
+            token_id, token_price_usd, rn,
+        )
+        
+        return {
+            "success": True,
+            "token_id": token_id,
+            "iteration": rn,
+            "price": token_price_usd,
+            "expected_sol": expected_sol,
+            "expected_usd": expected_usd,
+            "min_price_checked": min_price_usd,
+            "price_validation": "passed"
+        }
+
+
+async def force_buy(token_id: int) -> dict:
+    """Force-immediate buy using first free wallet and deducting cash with fees.
+    Also sets plan sell by TARGET_RETURN/ETA_REL_CAP.
+    
+    Supports both simulation mode (virtual wallets) and real trading mode (actual wallets).
+    Mode is controlled by config.REAL_TRADING_ENABLED.
+    """
+    # Check trading mode
+    real_trading = getattr(config, 'REAL_TRADING_ENABLED', False)
+    
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        # Ensure sim_wallets are initialized if empty (bootstrap for manual force-buy)
+        try:
+            cnt = await conn.fetchval("SELECT COUNT(*) FROM sim_wallets")
+        except Exception:
+            cnt = 0
+        if int(cnt or 0) == 0:
+            try:
+                wallets = int(getattr(config, 'VIRTUAL_WALLETS_COUNT', 5))
+            except Exception:
+                wallets = 5
+            try:
+                init_val = float(getattr(config, 'VIRTUAL_WALLET_INITIAL_USD', getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.5)))
+            except Exception:
+                init_val = 5.5
+            for i in range(1, max(1, wallets) + 1):
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO sim_wallets(id, name, initial_deposit_usd, cash_usd, updated_at)
+                        VALUES($1, $2, $3, $3, CURRENT_TIMESTAMP)
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        i, f"Wallet {i}", init_val
+                    )
+                except Exception:
+                    pass
+        # Get token info
+        token_row = await conn.fetchrow(
+            "SELECT sim_buy_iteration, real_wallet_id, token_address, decimals FROM tokens WHERE id=$1",
+            token_id
+        )
+        if not token_row:
+            return {"success": False, "message": "Token not found"}
+        
+        # Check if already entered (for both modes)
+        if token_row["sim_buy_iteration"] is not None:
+            return {"success": True, "message": "already entered", "token_id": token_id}
+
+        token_address = token_row["token_address"]
+        token_decimals = int(token_row["decimals"]) if token_row["decimals"] is not None else 6
+        
+        # REAL TRADING MODE
+        if real_trading:
+            # Find free real wallet
+            wallet_info = await get_free_wallet(conn)
+            if not wallet_info:
+                return {"success": False, "message": "No free real wallets available"}
+            
+            keypair = wallet_info["keypair"]
+            key_id = wallet_info["key_id"]
+            
+            # Get price
+            price_now = 0.0
+            tok = await conn.fetchrow("SELECT usd_price FROM tokens WHERE id=$1", token_id)
+            if tok and tok["usd_price"] and float(tok["usd_price"]) > 0:
+                price_now = float(tok["usd_price"]) or 0.0
+            
+            if price_now <= 0:
+                return {"success": False, "message": "Cannot buy: token price is zero or unavailable"}
+            
+            # Get iteration number
+            rn = await conn.fetchval(
+                "SELECT COUNT(*) FROM token_metrics_seconds WHERE token_id=$1",
+                token_id
+            ) or 0
+            
+            # Get entry_amount from wallet (user-configured per wallet)
+            # For real wallets, use entry_amount_usd from sim_wallets if set, otherwise use config default
+            wallet_row = await conn.fetchrow(
+                "SELECT entry_amount_usd, cash_usd FROM sim_wallets WHERE id=$1",
+                key_id
+            )
+            if wallet_row:
+                # Use wallet's entry_amount_usd if set (user configured), otherwise fallback to config
+                if wallet_row["entry_amount_usd"] is not None and float(wallet_row["entry_amount_usd"]) > 0:
+                    base_usd = float(wallet_row["entry_amount_usd"])
+                else:
+                    # Fallback to config default
+                    try:
+                        base_usd = float(getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.0))
+                    except Exception:
+                        base_usd = 5.0
+                
+                # Check if wallet has enough cash
+                cash_available = float(wallet_row["cash_usd"] or 0.0)
+                if cash_available < base_usd:
+                    return {"success": False, "message": f"Insufficient wallet balance: ${cash_available:.2f} < ${base_usd:.2f}"}
+            else:
+                # Wallet not found, use config default
+                try:
+                    base_usd = float(getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.0))
+                except Exception:
+                    base_usd = 5.0
+            
+            # Execute advanced real buy (with honeypot check via sell simulation)
+            buy_result = await execute_advanced_buy(token_id, keypair, base_usd, token_address, token_decimals)
+            
+            if not buy_result.get("success"):
+                return buy_result
+            
+            # Save to database
+            amount_tokens = buy_result["amount_tokens"]
+            price_actual = buy_result["price_usd"]
+            
+            # Plan sell
+            try:
+                target_ret = float(getattr(config, 'TARGET_RETURN', 0.15))
+            except Exception:
+                target_ret = 0.15
+            try:
+                eta_rel = int(getattr(config, 'ETA_REL_CAP', 15))
+            except Exception:
+                eta_rel = 15
+            plan_price = float(price_actual * (1.0 + target_ret))
+            plan_iter = int(rn + eta_rel)
+            
+            await conn.execute(
+                """
+                UPDATE tokens SET
+                  sim_buy_token_amount=$2,
+                  sim_buy_price_usd=$3,
+                  sim_buy_iteration=$4,
+                  sim_sell_token_amount=COALESCE(sim_sell_token_amount, $2),
+                  sim_plan_sell_price_usd=$5,
+                  sim_plan_sell_iteration=$6,
+                  real_wallet_id=$7,
+                  token_updated_at=CURRENT_TIMESTAMP
+                WHERE id=$1
+                """,
+                token_id, amount_tokens, price_actual, rn, plan_price, plan_iter, key_id
+            )
+            
+            # CRITICAL: Update wallet to bind it to this token (so UI shows blue color)
+            await conn.execute(
+                """
+                UPDATE sim_wallets
+                SET active_token_id=$2,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=$1 AND active_token_id IS NULL
+                """,
+                key_id, token_id
+            )
+            
+            # Create journal entry with transaction details
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO sim_wallet_history(
+                        wallet_id, token_id,
+                        entry_amount_usd, entry_token_amount, entry_price_usd, entry_iteration,
+                        entry_slippage_bps, entry_slippage_pct, entry_price_impact_pct,
+                        entry_transaction_fee_sol, entry_transaction_fee_usd,
+                        entry_expected_amount_usd, entry_actual_amount_usd,
+                        entry_signature,
+                        outcome, reason, created_at, updated_at
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'','manual',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                    """,
+                    key_id, token_id,
+                    base_usd, amount_tokens, price_actual, rn,
+                    buy_result.get("slippage_bps"),
+                    buy_result.get("slippage_pct"),
+                    buy_result.get("price_impact_pct"),
+                    buy_result.get("transaction_fee_sol"),
+                    buy_result.get("transaction_fee_usd"),
+                    buy_result.get("expected_amount_usd"),
+                    buy_result.get("actual_amount_usd"),
+                    buy_result.get("signature")
+                )
+            except Exception as e:
+                # Log but don't fail if journal entry fails
+                # print(f"[force_buy] Failed to create journal entry: {e}")
+                pass
+            
+            return {
+                "success": True,
+                "token_id": token_id,
+                "iteration": rn,
+                "price": price_actual,
+                "wallet_key_id": key_id,
+                "signature": buy_result.get("signature"),
+                "mode": "real",
+                "slippage_bps": buy_result.get("slippage_bps"),
+                "price_impact_pct": buy_result.get("price_impact_pct"),
+                "transaction_fee_usd": buy_result.get("transaction_fee_usd")
+            }
+        
+        # SIMULATION MODE: FORCE BUY: No restrictions except money check. Use price from tokens.usd_price first (fastest).
+        # Then try token_metrics_seconds if available for iteration number.
+        price_now = 0.0
+        sel_ts = None
+        rn = 0
+
+        # Priority 1: Get price from tokens.usd_price (always available, fastest)
+        tok = await conn.fetchrow("SELECT usd_price FROM tokens WHERE id=$1", token_id)
+        if tok and tok["usd_price"] and float(tok["usd_price"]) > 0:
+            price_now = float(tok["usd_price"]) or 0.0
+
+        # Priority 2: Try to get iteration number from token_metrics_seconds (if available)
+        if price_now > 0:
+        ts_row = await conn.fetchrow(
+            "SELECT MAX(ts) AS max_ts FROM token_metrics_seconds WHERE token_id=$1",
+            token_id,
+        )
+        max_ts = int(ts_row["max_ts"]) if ts_row and ts_row["max_ts"] is not None else None
+
+        if max_ts is not None:
+                # Try to find price near max_ts
+            near = await conn.fetchrow(
+                """
+                SELECT ts, usd_price
+                FROM token_metrics_seconds
+                    WHERE token_id=$1 AND usd_price IS NOT NULL AND usd_price>0 
+                      AND ts BETWEEN $2::bigint-15 AND $2::bigint+15
+                ORDER BY ABS(ts - $2::bigint) ASC, ts DESC
+                LIMIT 1
+                """,
+                    token_id, max_ts
+            )
+            if near and near["usd_price"]:
+                sel_ts = int(near["ts"]) if near["ts"] is not None else None
+                    # Use price from metrics if available (more accurate)
+                price_now = float(near["usd_price"]) or price_now
+            else:
+                    # Fallback to last price from metrics
+            last_pr = await conn.fetchrow(
+                """
+                SELECT ts, usd_price
+                FROM token_metrics_seconds
+                WHERE token_id=$1 AND usd_price IS NOT NULL AND usd_price>0
+                ORDER BY ts DESC LIMIT 1
+                """,
+                token_id
+            )
+            if last_pr and last_pr["usd_price"]:
+                sel_ts = int(last_pr["ts"]) if last_pr["ts"] is not None else None
+                price_now = float(last_pr["usd_price"]) or price_now
+
+            # Compute iteration number if we have ts
+        if sel_ts is not None:
+            rn_row = await conn.fetchrow(
+                """
+                SELECT rn FROM (
+                  SELECT ts, ROW_NUMBER() OVER (ORDER BY ts ASC) AS rn
+                  FROM token_metrics_seconds WHERE token_id=$1
+                ) s WHERE ts=$2
+                """,
+                token_id, sel_ts
+            )
+            rn = int(rn_row["rn"]) if rn_row and rn_row["rn"] is not None else 0
+        elif max_ts is not None:
+            rn_row = await conn.fetchrow(
+                """
+                SELECT rn FROM (
+                  SELECT ts, ROW_NUMBER() OVER (ORDER BY ts ASC) AS rn
+                  FROM token_metrics_seconds WHERE token_id=$1
+                ) s ORDER BY ts DESC LIMIT 1
+                """,
+                token_id
+            )
+            rn = int(rn_row["rn"]) if rn_row and rn_row["rn"] is not None else 0
+        else:
+                # No metrics yet - use current count as iteration
+                rn = await conn.fetchval(
+                    "SELECT COUNT(*) FROM token_metrics_seconds WHERE token_id=$1",
+                    token_id
+                ) or 0
+
+        # If price is zero or negative, cannot buy (logical requirement)
+        if price_now <= 0:
+            return {"success": False, "message": "Cannot buy: token price is zero or unavailable (tokens.usd_price is null or zero)"}
+
+        # TEMPORARILY DISABLED: Run honeypot check for informational purposes only (never block force-buy)
+        # hp_res = await check_honeypot(token_id, at_iter=rn if rn > 0 else None)
+        hp_res = {"honeypot": False, "reasons": []}  # Placeholder while disabled
+
+        # Get entry_amount from wallet (user-configured per wallet)
+        w = await conn.fetchrow(
+            "SELECT id, cash_usd, entry_amount_usd FROM sim_wallets WHERE active_token_id IS NULL ORDER BY id ASC LIMIT 1"
+        )
+        if not w:
+            return {"success": False, "message": "No free wallets available"}
+        
+        # Use wallet's entry_amount_usd if set (user configured), otherwise fallback to config default
+        if w["entry_amount_usd"] is not None and float(w["entry_amount_usd"]) > 0:
+            base_usd = float(w["entry_amount_usd"])
+        else:
+        try:
+            base_usd = float(getattr(config, 'VIRTUAL_WALLET_DEPOSIT_USD', 5.0))
+        except Exception:
+            base_usd = 5.0
+
+        # Check if wallet has enough cash
+        cash_available = float(w["cash_usd"] or 0.0)
+        if cash_available < base_usd:
+            return {"success": False, "message": f"Insufficient wallet balance: ${cash_available:.2f} < ${base_usd:.2f}"}
+        wid = int(w['id'])
+        cash = float(w['cash_usd'] or 0.0)
+        if cash <= 0:
+            return {"success": False, "message": "Wallet has no cash"}
+
+        # fees
+        try:
+            bps = (int(getattr(config, 'SIM_FEES_SLIPPAGE_BPS', 250)) + int(getattr(config, 'SIM_FEES_JUPITER_BPS', 0))) / 10000.0
+        except Exception:
+            bps = 0.0
+        try:
+            sol_fee = float(getattr(config, 'SIM_FEES_SOL_PER_TX', 0.000005))
+            sol_price = float(getattr(config, 'SOL_PRICE_FALLBACK', 193.0))
+            net_fee = sol_fee * sol_price
+        except Exception:
+            net_fee = 0.0
+
+        max_base = max(0.0, (cash - net_fee) / (1.0 + bps)) if (1.0 + bps) > 0 else 0.0
+        entry_base = min(base_usd, max_base)
+        if entry_base <= 0:
+            return {"success": False, "message": "Insufficient cash after fees"}
+        total_cost = entry_base * (1.0 + bps) + net_fee
+        amount_tokens = float(entry_base / price_now) if price_now > 0 else 0.0
+
+        # plan
+        try:
+            target_ret = float(getattr(config, 'TARGET_RETURN', 0.15))
+        except Exception:
+            target_ret = 0.15
+        try:
+            eta_rel = int(getattr(config, 'ETA_REL_CAP', 15))
+        except Exception:
+            eta_rel = 15
+        plan_price = float(price_now * (1.0 + target_ret))
+        plan_iter = int(rn + eta_rel)
+
+        await conn.execute(
+            """
+            UPDATE tokens SET
+              sim_buy_token_amount=$2,
+              sim_buy_price_usd=$3,
+              sim_buy_iteration=$4,
+              sim_sell_token_amount=COALESCE(sim_sell_token_amount, $2),
+              sim_plan_sell_price_usd=$5,
+              sim_plan_sell_iteration=$6,
+              sim_wallet_id=$7,
+              token_updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1
+            """,
+            token_id, amount_tokens, price_now, rn, plan_price, plan_iter, wid
+        )
+
+        # Update wallet atomically - check if still free and update
+        wallet_update_result = await conn.execute(
+            """
+            UPDATE sim_wallets
+            SET active_token_id=$2,
+                entry_amount_usd=$3,
+                cash_usd=GREATEST(cash_usd - $4::numeric, 0::numeric),
+                updated_at=CURRENT_TIMESTAMP
+            WHERE id=$1 AND active_token_id IS NULL
+            """,
+            wid, token_id, entry_base, total_cost
+        )
+        # Extract number of affected rows from asyncpg result string (e.g., "UPDATE 1" or "UPDATE 0")
+        try:
+            affected_rows = int(wallet_update_result.split()[-1]) if wallet_update_result else 0
+        except Exception:
+            affected_rows = 0
+        # If wallet was already taken by another transaction, fail
+        if affected_rows == 0:
+            return {"success": False, "message": "Wallet was taken by another transaction or not found. Please try again."}
+
+        # Write wallet history (open position)
+        try:
+            await conn.execute(
+                """
+                INSERT INTO sim_wallet_history(
+                    wallet_id, token_id,
+                    entry_amount_usd, entry_token_amount, entry_price_usd, entry_iteration,
+                    outcome, reason, created_at, updated_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,'', 'manual', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                wid, token_id, entry_base, amount_tokens, price_now, rn
+            )
+        except Exception:
+            pass
+
+        return {"success": True, "token_id": token_id, "iteration": rn, "price": price_now, "wallet_id": wid, "honeypot": hp_res.get("honeypot", False), "reasons": hp_res.get("reasons", [])}

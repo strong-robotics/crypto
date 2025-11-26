@@ -1,0 +1,78 @@
+2025-10-18 21:31:48.755 CEST [90862] LOG:  starting PostgreSQL 16.10 (Homebrew) on aarch64-apple-darwin24.4.0, compiled by Apple clang version 17.0.0 (clang-1700.0.13.3), 64-bit
+2025-10-18 21:31:48.756 CEST [90862] LOG:  could not bind IPv6 address "::1": Address already in use
+2025-10-18 21:31:48.756 CEST [90862] HINT:  Is another postmaster already running on port 5432? If not, wait a few seconds and retry.
+2025-10-18 21:31:48.756 CEST [90862] LOG:  could not bind IPv4 address "127.0.0.1": Address already in use
+2025-10-18 21:31:48.756 CEST [90862] HINT:  Is another postmaster already running on port 5432? If not, wait a few seconds and retry.
+2025-10-18 21:31:48.756 CEST [90862] WARNING:  could not create listen socket for "localhost"
+2025-10-18 21:31:48.757 CEST [90862] FATAL:  could not create any TCP/IP sockets
+2025-10-18 21:31:48.757 CEST [90862] LOG:  database system is shut down
+2025-10-18 19:32:18.153 GMT [92921] LOG:  redirecting log output to logging collector process
+2025-10-18 19:32:18.153 GMT [92921] HINT:  Future log output will appear in directory "logs".
+2025-10-18 20:27:56.801 GMT [76009] LOG:  redirecting log output to logging collector process
+2025-10-18 20:27:56.801 GMT [76009] HINT:  Future log output will appear in directory "logs".
+2025-10-20 17:13:32.098 GMT [45721] LOG:  redirecting log output to logging collector process
+2025-10-20 17:13:32.098 GMT [45721] HINT:  Future log output will appear in directory "logs".
+2025-10-21 09:43:56.043 GMT [27651] LOG:  redirecting log output to logging collector process
+2025-10-21 09:43:56.043 GMT [27651] HINT:  Future log output will appear in directory "logs".
+2025-10-21 20:47:50.364 GMT [78881] LOG:  redirecting log output to logging collector process
+2025-10-21 20:47:50.364 GMT [78881] HINT:  Future log output will appear in directory "logs".
+2025-10-21 23:53:23.167 GMT [22228] LOG:  redirecting log output to logging collector process
+2025-10-21 23:53:23.167 GMT [22228] HINT:  Future log output will appear in directory "logs".
+2025-10-22 22:45:59.589 GMT [83053] LOG:  redirecting log output to logging collector process
+2025-10-22 22:45:59.589 GMT [83053] HINT:  Future log output will appear in directory "logs".
+2025-10-23 14:10:48.729 GMT [1450] LOG:  redirecting log output to logging collector process
+2025-10-23 14:10:48.729 GMT [1450] HINT:  Future log output will appear in directory "logs".
+2025-10-24 10:56:38.436 GMT [35707] LOG:  redirecting log output to logging collector process
+2025-10-24 10:56:38.436 GMT [35707] HINT:  Future log output will appear in directory "logs".
+2025-10-25 14:16:57.322 GMT [33598] LOG:  redirecting log output to logging collector process
+2025-10-25 14:16:57.322 GMT [33598] HINT:  Future log output will appear in directory "logs".
+2025-10-27 11:16:01.990 GMT [33047] LOG:  redirecting log output to logging collector process
+2025-10-27 11:16:01.990 GMT [33047] HINT:  Future log output will appear in directory "logs".
+2025-10-27 11:17:09.112 GMT [36851] LOG:  redirecting log output to logging collector process
+2025-10-27 11:17:09.112 GMT [36851] HINT:  Future log output will appear in directory "logs".
+2025-10-27 23:33:19.706 GMT [20110] LOG:  redirecting log output to logging collector process
+2025-10-27 23:33:19.706 GMT [20110] HINT:  Future log output will appear in directory "logs".
+2025-10-31 11:19:47.940 GMT [24411] LOG:  redirecting log output to logging collector process
+2025-10-31 11:19:47.940 GMT [24411] HINT:  Future log output will appear in directory "logs".
+2025-10-31 11:32:46.203 GMT [66254] FATAL:  pre-existing shared memory block (key 103230645, ID 65536) is still in use
+2025-10-31 11:32:46.203 GMT [66254] HINT:  Terminate any old server processes associated with data directory "/Users/yevhenvasylenko/Documents/Projects/Crypto/App/server/db/pgdata".
+2025-10-31 11:35:12.977 GMT [75184] FATAL:  pre-existing shared memory block (key 103230645, ID 65536) is still in use
+2025-10-31 11:35:12.977 GMT [75184] HINT:  Terminate any old server processes associated with data directory "/Users/yevhenvasylenko/Documents/Projects/Crypto/App/server/db/pgdata".
+2025-11-02 17:36:43.169 GMT [13464] LOG:  redirecting log output to logging collector process
+2025-11-02 17:36:43.169 GMT [13464] HINT:  Future log output will appear in directory "logs".
+2025-11-03 17:22:57.586 GMT [21886] LOG:  redirecting log output to logging collector process
+2025-11-03 17:22:57.586 GMT [21886] HINT:  Future log output will appear in directory "logs".
+2025-11-05 00:54:35.470 GMT [12267] LOG:  redirecting log output to logging collector process
+2025-11-05 00:54:35.470 GMT [12267] HINT:  Future log output will appear in directory "logs".
+2025-11-05 15:26:44.333 GMT [41863] FATAL:  pre-existing shared memory block (key 103230645, ID 65536) is still in use
+2025-11-05 15:26:44.333 GMT [41863] HINT:  Terminate any old server processes associated with data directory "/Users/yevhenvasylenko/Documents/Projects/Crypto/App/server/db/pgdata".
+2025-11-05 15:27:21.925 GMT [42243] FATAL:  pre-existing shared memory block (key 103230645, ID 65536) is still in use
+2025-11-05 15:27:21.925 GMT [42243] HINT:  Terminate any old server processes associated with data directory "/Users/yevhenvasylenko/Documents/Projects/Crypto/App/server/db/pgdata".
+2025-11-07 16:53:06.709 GMT [17749] LOG:  redirecting log output to logging collector process
+2025-11-07 16:53:06.709 GMT [17749] HINT:  Future log output will appear in directory "logs".
+2025-11-07 21:23:20.220 GMT [17813] LOG:  redirecting log output to logging collector process
+2025-11-07 21:23:20.220 GMT [17813] HINT:  Future log output will appear in directory "logs".
+2025-11-08 21:44:38.604 GMT [63027] LOG:  redirecting log output to logging collector process
+2025-11-08 21:44:38.604 GMT [63027] HINT:  Future log output will appear in directory "logs".
+2025-11-10 20:02:20.786 GMT [11070] LOG:  redirecting log output to logging collector process
+2025-11-10 20:02:20.786 GMT [11070] HINT:  Future log output will appear in directory "logs".
+2025-11-12 02:14:14.527 GMT [40030] LOG:  redirecting log output to logging collector process
+2025-11-12 02:14:14.527 GMT [40030] HINT:  Future log output will appear in directory "logs".
+2025-11-12 09:04:07.628 GMT [91105] LOG:  redirecting log output to logging collector process
+2025-11-12 09:04:07.628 GMT [91105] HINT:  Future log output will appear in directory "logs".
+2025-11-12 18:30:37.984 GMT [15714] LOG:  redirecting log output to logging collector process
+2025-11-12 18:30:37.984 GMT [15714] HINT:  Future log output will appear in directory "logs".
+2025-11-17 23:13:10.070 GMT [31379] LOG:  redirecting log output to logging collector process
+2025-11-17 23:13:10.070 GMT [31379] HINT:  Future log output will appear in directory "logs".
+2025-11-18 12:16:09.971 GMT [13848] LOG:  redirecting log output to logging collector process
+2025-11-18 12:16:09.971 GMT [13848] HINT:  Future log output will appear in directory "logs".
+2025-11-18 14:45:10.809 GMT [26392] LOG:  redirecting log output to logging collector process
+2025-11-18 14:45:10.809 GMT [26392] HINT:  Future log output will appear in directory "logs".
+2025-11-20 13:25:33.310 GMT [9198] LOG:  redirecting log output to logging collector process
+2025-11-20 13:25:33.310 GMT [9198] HINT:  Future log output will appear in directory "logs".
+2025-11-21 16:16:36.500 GMT [72130] LOG:  redirecting log output to logging collector process
+2025-11-21 16:16:36.500 GMT [72130] HINT:  Future log output will appear in directory "logs".
+2025-11-23 22:11:57.684 GMT [6085] LOG:  redirecting log output to logging collector process
+2025-11-23 22:11:57.684 GMT [6085] HINT:  Future log output will appear in directory "logs".
+2025-11-25 15:49:45.794 GMT [12869] LOG:  redirecting log output to logging collector process
+2025-11-25 15:49:45.794 GMT [12869] HINT:  Future log output will appear in directory "logs".
