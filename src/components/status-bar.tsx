@@ -14,7 +14,8 @@ interface StatusBarProps {
   balanceTimerRunning?: boolean;
   tokensTimerRunning?: boolean;
   chartTimerRunning?: boolean;
-  onAllStart: () => void;   // Big left Start (connect all WS)
+  onAllStartLive: () => void;   // Big left Start (live)
+  onAllStartHistory: () => void; // Start History mode
   onAllStop: () => void;    // Big left Stop (disconnect all WS)
   onAnalyzerStart: () => void;
   onAnalyzerStop: () => void;
@@ -23,6 +24,7 @@ interface StatusBarProps {
   onToggleScanner?: () => void; // Stop/resume scanner
   scannerPaused?: boolean;
   aiEnabled?: boolean;
+  historyMode?: boolean;
   onAIToggle?: () => void;
 }
 
@@ -61,7 +63,8 @@ export function StatusBar({
   balanceTimerRunning = false,
   tokensTimerRunning = false,
   chartTimerRunning = false,
-  onAllStart,
+  onAllStartLive,
+  onAllStartHistory,
   onAllStop,
   // onNewTokensStart,
   // onNewTokensStop,
@@ -72,6 +75,7 @@ export function StatusBar({
   onToggleScanner,
   scannerPaused = false,
   aiEnabled = false,
+  historyMode = false,
   onAIToggle
 }: StatusBarProps) {
   return (
@@ -110,8 +114,10 @@ export function StatusBar({
         </div>
 
         {/* Big Start/Stop buttons for overall WS control */}
-        <div style={{ display: 'flex', flexDirection: 'column' }}>
-          <button onClick={onAllStart} style={{ backgroundColor: '#22c55e', color: 'white', border: 'none', borderRadius: '12px', padding: '7px 10px', fontSize: '14px', fontWeight: 'bold', cursor: 'pointer', marginTop: '8px', marginBottom: '10px' }}>Start</button>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          <div style={{ fontSize: '10px', fontWeight: '500', color: '#6b7280' }}>Mode: {historyMode ? 'History' : 'Live'}</div>
+          <button onClick={onAllStartLive} style={{ backgroundColor: '#16a34a', color: 'white', border: 'none', borderRadius: '12px', padding: '7px 10px', fontSize: '14px', fontWeight: 'bold', cursor: 'pointer' }}>Start Live</button>
+          <button onClick={onAllStartHistory} style={{ backgroundColor: '#0ea5e9', color: 'white', border: 'none', borderRadius: '12px', padding: '7px 10px', fontSize: '14px', fontWeight: 'bold', cursor: 'pointer' }}>Start History</button>
           <button onClick={onAllStop} style={{ backgroundColor: '#c75c5c', color: 'white', border: 'none', borderRadius: '12px', padding: '7px 10px', fontSize: '14px', fontWeight: 'bold', cursor: 'pointer' }}>Stop</button>
         </div>
       </div>

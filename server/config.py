@@ -256,7 +256,7 @@ class Config:
     # after this many iterations if no entry. Saves Jupiter API requests on clearly worthless tokens.
     # Keep 100 iterations for future ML training data.
     # Set to same value as CLEANER_NO_ENTRY_ITERS (1 hour) to allow viewing patterns without entry
-    BAD_PATTERN_HISTORY_READY_ITERS = 7200  # 1 hour - same as CLEANER_NO_ENTRY_ITERS
+    BAD_PATTERN_HISTORY_READY_ITERS = 14400  # 1 hour - same as CLEANER_NO_ENTRY_ITERS
     # Minimal pattern score to allow entering a token (0..100). Only tokens classified
     # with score >= this threshold are eligible for simulated buy.
     PATTERN_MIN_SCORE = 80
@@ -323,9 +323,9 @@ class Config:
     CLEANER_BATCH_LIMIT = 200   # max tokens to purge per pass
     # Do NOT remove tokens with a valid pair until they live at least this many seconds without entry
     # Environment override removed – use explicit config constants
-    CLEANER_NO_ENTRY_AGE_SEC = 7200  # 1 hour - allow viewing patterns without entry
+    CLEANER_NO_ENTRY_AGE_SEC = 14400  # 1 hour - allow viewing patterns without entry
     # And do not remove just by iteration count unless explicitly set (>0)
-    CLEANER_NO_ENTRY_ITERS = 7200  # 1 hour - allow viewing patterns without entry
+    CLEANER_NO_ENTRY_ITERS = 14400  # 1 hour - allow viewing patterns without entry
 
     # ============================================================================
     # NEW TOKENS INSERT CAP (temporary)

@@ -30,6 +30,7 @@ type RawTokenMessage = {
   stats_24h_num_buys?: number;
   stats_24h_num_sells?: number;
   history_ready?: boolean | string | number | null;
+  iteration_count?: number | string | null;
   // V3 Jupiter analyzer fields
   num_buys_24h?: number;
   num_sells_24h?: number;
@@ -81,7 +82,7 @@ type TokenState = {
   totalTx: number;
   buyTx: number;
   sellTx: number;
-  historyReady: boolean;
+  liveSeconds?: number | null;
   live_time?: string;
   pattern_segments?: string[];
   pattern_segment_decision?: string | null;
@@ -105,6 +106,7 @@ export default function Home() {
   const [aiEnabled, setAiEnabled] = useState(true); // ТЕСТОВИЙ РЕЖИМ: увімкнено прогнози ШІ
   const [tokenCount, setTokenCount] = useState(0); // Tokens with valid pairs and history_ready = false
   const [totalTokenCount, setTotalTokenCount] = useState(0); // Total tokens in database
+  const [historyMode, setHistoryMode] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const wsTokensRef = useRef<WebSocket | null>(null);
   const wsChartRef = useRef<WebSocket | null>(null);
@@ -143,7 +145,7 @@ export default function Home() {
       totalTx: 0,
       buyTx: 0,
     sellTx: 0,
-    historyReady: false,
+    liveSeconds: null,
     plan_sell_iteration: null,
     plan_sell_price_usd: null,
     pattern_segments: ["unknown", "unknown", "unknown"],
@@ -391,8 +393,13 @@ export default function Home() {
             setTokens(prevTokens => {
               const byId = new Map(prevTokens.map(t => [t.id, t]));
               const formattedTokens: TokenState[] = (tokenData.tokens || []).map((token, index) => {
-              const historyReadyRaw = token.history_ready;
-              const historyReady = historyReadyRaw === true || historyReadyRaw === "true" || historyReadyRaw === 1;
+              const iterationCountRaw = token.iteration_count;
+              const liveSecondsValue = (() => {
+                if (iterationCountRaw === null || iterationCountRaw === undefined) return NaN;
+                if (typeof iterationCountRaw === "number") return iterationCountRaw;
+                const parsed = Number(iterationCountRaw);
+                return Number.isFinite(parsed) ? parsed : NaN;
+              })();
               const prev = byId.get(token.id);
               const preservedChart = prev && Array.isArray(prev.chartData) && prev.chartData.length > 0
                 ? prev.chartData
@@ -481,7 +488,9 @@ export default function Home() {
                 totalTx: (token.num_buys_24h || 0) + (token.num_sells_24h || 0),
                 buyTx: token.num_buys_24h || 0,
                 sellTx: token.num_sells_24h || 0,
-                historyReady,
+                liveSeconds: Number.isFinite(liveSecondsValue)
+                  ? liveSecondsValue
+                  : prev?.liveSeconds ?? null,
                 live_time: token.live_time,
                 // Real trading data from wallet_history and tokens table
                 // Use only server-provided values; if null → no entry/exit -> hide reference lines
@@ -637,6 +646,15 @@ export default function Home() {
         setTokensTimerRunning(!!data.status.tokens?.auto_refresh_running);
         setChartTimerRunning(!!data.status.charts?.is_running);
         setAiEnabled(!!data.status.ai_forecast?.is_running);
+        if (typeof data.status.tokens?.token_count === 'number') {
+          setTokenCount(data.status.tokens.token_count);
+        }
+        if (typeof data.status.tokens?.total_token_count === 'number') {
+          setTotalTokenCount(data.status.tokens.total_token_count);
+        }
+        if (typeof data.status.mode === 'string') {
+          setHistoryMode(data.status.mode.toLowerCase() === 'history');
+        }
       }
     } catch (e) {
       console.error("❌ Error checking timers status:", e);
@@ -664,10 +682,11 @@ export default function Home() {
   };
 
   // Big left Start/Stop — управляют всеми тремя WS
-  const startAllWS = async () => {
+  const startAllWS = async (mode: 'live' | 'history' = 'live') => {
     // Запускаем фоновые таймеры на сервере
     try {
-      await fetch(`${API_BASE}/api/system/timers/start`, { method: "POST" });
+      await fetch(`${API_BASE}/api/system/timers/start?mode=${mode}`, { method: "POST" });
+      setHistoryMode(mode === 'history');
       // Локально помечаем таймеры как запущенные (уточним реальное состояние ниже)
       setBalanceTimerRunning(true);
       setTokensTimerRunning(true);
@@ -703,6 +722,8 @@ export default function Home() {
     await checkAnalyzerStatus();
     await fetchScannerStatus();
   };
+  const startLiveWS = async () => startAllWS('live');
+  const startHistoryWS = async () => startAllWS('history');
 
   const handleAnalyzerStart = async () => {
     try {
@@ -824,7 +845,8 @@ export default function Home() {
           balanceTimerRunning={balanceTimerRunning}
           tokensTimerRunning={tokensTimerRunning}
           chartTimerRunning={chartTimerRunning}
-          onAllStart={startAllWS}
+          onAllStartLive={startLiveWS}
+          onAllStartHistory={startHistoryWS}
           onAllStop={stopAllWS}
           onAnalyzerStart={handleAnalyzerStart}
           onAnalyzerStop={handleAnalyzerStop}
@@ -833,6 +855,7 @@ export default function Home() {
           onTradesStart={startLiveTrades}
           onTradesStop={stopLiveTrades}
           aiEnabled={aiEnabled}
+          historyMode={historyMode}
           onAIToggle={async () => {
             try {
               if (!aiEnabled) {

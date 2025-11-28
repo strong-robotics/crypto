@@ -25,13 +25,16 @@ class TokensReaderV3:
         
         self.last_updated_at_sum: str = ""
         # Show historical tokens (archived tokens from tokens_history) when enabled in config/env
-        self.show_history: bool = bool(str(os.getenv("TOKENS_SHOW_HISTORY", getattr(config, 'TOKENS_SHOW_HISTORY', False))).lower() not in ("0", "false", "none", ""))
+        self.history_mode: bool = bool(str(os.getenv("TOKENS_SHOW_HISTORY", getattr(config, 'TOKENS_SHOW_HISTORY', False))).lower() not in ("0", "false", "none", ""))
         # Disable sorting and show only historical tokens in insertion order
         self.disable_sort: bool = bool(str(os.getenv("TOKENS_DISABLE_SORT", getattr(config, 'TOKENS_DISABLE_SORT', False))).lower() not in ("0", "false", "none", ""))
 
     def _use_history_source(self) -> bool:
         """Return True when tokens history tables should be used."""
-        return bool(self.show_history or self.disable_sort)
+        return bool(self.history_mode or self.disable_sort)
+
+    def set_history_mode(self, enabled: bool):
+        self.history_mode = bool(enabled)
     
     async def ensure_connection(self):
         pass
@@ -1024,7 +1027,7 @@ class TokensReaderV3:
                         last_updated_row = await conn.fetchrow(
                             "SELECT MAX(COALESCE(archived_at, updated_at, token_updated_at, created_at)) AS u FROM tokens_history"
                         )
-                    elif self.show_history:
+                    elif self.history_mode:
                         count = await conn.fetchval(
                             "SELECT COUNT(*) FROM tokens WHERE token_pair IS NOT NULL AND token_pair <> '' AND token_pair <> token_address"
                         ) or 0

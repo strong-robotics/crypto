@@ -483,17 +483,17 @@ class JupiterAnalyzerV3:
                     # Check MIN_TX_COUNT
                     if total_tx < min_tx:
                         decision = "not"
-                        if getattr(config, "DEBUG", False):
-                            print(
-                                f"[JUNO] token {token_id}: MIN_TX_COUNT check failed (total_tx={total_tx:.0f} < {min_tx:.0f}) - setting decision=not"
-                            )
+                        # if getattr(config, "DEBUG", False):
+                        #     print(
+                        #         f"[JUNO] token {token_id}: MIN_TX_COUNT check failed (total_tx={total_tx:.0f} < {min_tx:.0f}) - setting decision=not"
+                        #     )
                     # Check MIN_SELL_SHARE (only if MIN_TX_COUNT passed)
                     elif sell_share < min_sell_share:
                         decision = "not"
-                        if getattr(config, "DEBUG", False):
-                            print(
-                                f"[JUNO] token {token_id}: MIN_SELL_SHARE check failed (sell_share={sell_share:.2%} < {min_sell_share:.2%}, total_tx={total_tx:.0f}) - setting decision=not"
-                            )
+                        # if getattr(config, "DEBUG", False):
+                        #     print(
+                        #         f"[JUNO] token {token_id}: MIN_SELL_SHARE check failed (sell_share={sell_share:.2%} < {min_sell_share:.2%}, total_tx={total_tx:.0f}) - setting decision=not"
+                        #     )
         except Exception as e:
             if getattr(config, "DEBUG", False):
                 print(f"[JUNO] token {token_id}: error checking MIN_TX_COUNT/MIN_SELL_SHARE: {e}")
@@ -1009,7 +1009,6 @@ class JupiterAnalyzerV3:
                                 is_flat = (withdraw_iter is not None)
                         
                         if (total >= zero_tail and pos_cnt == 0) or is_flat:
-                            zero_tail_triggered = True
                             # Check if there is an open position in wallet_history
                             open_position = await conn.fetchrow(
                                 """
@@ -1022,18 +1021,12 @@ class JupiterAnalyzerV3:
                             )
                             
                             if open_position:
-                                # Open position exists - close dead token at price 0
-                                rn = await conn.fetchval(
-                                    "SELECT COUNT(*) FROM token_metrics_seconds WHERE token_id=$1",
-                                    token_id
-                                ) or 0
-                                
-                                # Finalize via centralized function (close history, archive token)
-                                try:
-                                    await finalize_token_sale(token_id, conn, reason='zero_liquidity')
-                                except Exception:
-                                    pass
+                                # Wallet вошёл в токен – не закрываем позицию автоматически.
+                                # Zero-tail guard пропускаем, чтобы не продавать живые токены
+                                # при коротких паузах обновления цены.
+                                pass
                             else:
+                                zero_tail_triggered = True
                                 try:
                                     await conn.execute(
                                         """
@@ -1341,11 +1334,11 @@ class JupiterAnalyzerV3:
 
                 # Bad pattern guard: archive tokens with bad patterns (no entry) after BAD_PATTERN_HISTORY_READY_ITERS iterations
                 # This saves Jupiter API requests on tokens that are clearly not worth tracking
-                # Default: 7200 iterations (1 hour) to allow viewing patterns without entry
+                # Default: 14400 iterations (1 hour) to allow viewing patterns without entry
                 try:
                     bad_patterns = ['black_hole', 'flatliner', 'rug_prequel', 'death_spike', 
                                    'smoke_bomb', 'mirage_rise', 'panic_sink']
-                    bad_patterns_iter_threshold = int(getattr(config, 'BAD_PATTERN_HISTORY_READY_ITERS', 7200))
+                    bad_patterns_iter_threshold = int(getattr(config, 'BAD_PATTERN_HISTORY_READY_ITERS', 14400))
                     
                     if bad_patterns_iter_threshold > 0:
                         # Check if token has bad pattern, no entry, and enough iterations
@@ -1400,9 +1393,9 @@ class JupiterAnalyzerV3:
 
                 # Archive tokens with pattern_segment_decision = "not" (no entry) after BAD_PATTERN_HISTORY_READY_ITERS iterations
                 # This includes tokens with liquidity withdrawal (flat mcap/price) and bad segments
-                # Default: 7200 iterations (1 hour) to allow viewing patterns without entry
+                # Default: 14400 iterations (1 hour) to allow viewing patterns without entry
                 try:
-                    bad_decision_iter_threshold = int(getattr(config, 'BAD_PATTERN_HISTORY_READY_ITERS', 7200))
+                    bad_decision_iter_threshold = int(getattr(config, 'BAD_PATTERN_HISTORY_READY_ITERS', 14400))
                     
                     if bad_decision_iter_threshold > 0:
                         # Check if token has decision = "not", no entry, and enough iterations

@@ -32,7 +32,7 @@ class ChartDataReaderV3:
 
         env_show_history = os.getenv("TOKENS_SHOW_HISTORY")
         env_disable_sort = os.getenv("TOKENS_DISABLE_SORT")
-        self.show_history = bool(str(env_show_history if env_show_history is not None else getattr(config, 'TOKENS_SHOW_HISTORY', False)).lower() not in ("0", "false", "none", ""))
+        self.history_mode = bool(str(env_show_history if env_show_history is not None else getattr(config, 'TOKENS_SHOW_HISTORY', False)).lower() not in ("0", "false", "none", ""))
         self.disable_sort = bool(str(env_disable_sort if env_disable_sort is not None else getattr(config, 'TOKENS_DISABLE_SORT', False)).lower() not in ("0", "false", "none", ""))
     
     async def ensure_connection(self):
@@ -43,8 +43,11 @@ class ChartDataReaderV3:
         """PostgreSQL - не потрібне (connection pool закривається глобально)"""
         pass
 
+    def set_history_mode(self, enabled: bool):
+        self.history_mode = bool(enabled)
+
     def _use_history_source(self) -> bool:
-        return bool(self.show_history or self.disable_sort)
+        return bool(self.history_mode or self.disable_sort)
 
     def _tokens_table(self) -> str:
         return "tokens_history" if self._use_history_source() else "tokens"
@@ -1242,10 +1245,6 @@ class ChartDataReaderV3:
     
     async def start_auto_refresh(self):
         """Запустити автоматичне оновлення"""
-        if self._use_history_source():
-            if self.debug:
-                print("📊 History mode – chart auto-refresh disabled")
-            return {"success": False, "message": "history_mode"}
         if not self.is_running:
             self.is_running = True
             self.refresh_task = asyncio.create_task(self._auto_refresh_loop())

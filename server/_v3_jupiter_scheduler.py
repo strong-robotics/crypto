@@ -150,8 +150,8 @@ class JupiterScheduler:
                     dry_run=False,
                     older_than_sec=older,
                     limit=limit,
-                    no_entry_age_sec=int(getattr(config, 'CLEANER_NO_ENTRY_AGE_SEC', 7200)),
-                    no_entry_iters=int(getattr(config, 'CLEANER_NO_ENTRY_ITERS', 7200)),
+                    no_entry_age_sec=int(getattr(config, 'CLEANER_NO_ENTRY_AGE_SEC', 14400)),
+                    no_entry_iters=int(getattr(config, 'CLEANER_NO_ENTRY_ITERS', 14400)),
                 )
                 # Cleaner runs silently
                 pass

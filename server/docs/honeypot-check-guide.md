@@ -174,7 +174,7 @@ if (!check.safe) {
       "honeypot": true,
       "reasons": ["⚠️ Jupiter: can BUY but CANNOT SELL - HONEYPOT!"]
     },
-    "token_age_seconds": 7200,
+    "token_age_seconds": 14400,
     "token_created_at": "2025-10-08T23:00:00",
     "is_very_new": false
   }

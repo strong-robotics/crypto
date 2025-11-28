@@ -8,12 +8,11 @@ type MarkerInput = {
 };
 
 const DEFAULT_HISTORY_MARKERS: MarkerInput[] = [
-  { value: 25, color: '#ef4444' },
-  { value: 35, color: '#22c55e' },
-  { value: 75, color: '#ef4444' },
-  { value: 85, color: '#22c55e' },
-  { value: 115, color: '#ef4444' },
-  { value: 125, color: '#22c55e' },
+  { value: 250, color: '#94a3b8' }, // окно 1 → окно 2 граница
+  { value: 670, color: '#ef4444' }, // коридор A start
+  { value: 730, color: '#22c55e' }, // коридор A end
+  { value: 940, color: '#ef4444' }, // коридор B start
+  { value: 1000, color: '#22c55e' }, // коридор B end
 ];
 
 const parseMarkerValue = (part: string): MarkerInput | null => {
@@ -64,7 +63,7 @@ interface TokenCellProps {
   totalTx: number; // total transactions (24h)
   buyTx: number;   // buy transactions (24h)
   sellTx: number;  // sell transactions (24h)
-  historyReady?: boolean; // статус для Live/Ended
+  liveSeconds?: number | null;
   live_time?: string; // Готовий рядок часу життя з сервера
   // Real trading data from wallet_history and tokens table
   entry_token_amount?: number | null;  // Кількість токенів при вході
@@ -105,7 +104,7 @@ export function TokenCell({
   totalTx,
   buyTx,
   sellTx,
-  historyReady,
+  liveSeconds,
   live_time,
   entry_token_amount,
   entry_price_usd,
@@ -122,7 +121,8 @@ export function TokenCell({
 }: TokenCellProps) {
   // Всі значення приходять з бекенду
   const ENTRY_SEC: number | null = (typeof entry_iteration === 'number') ? entry_iteration : null;
-  const historyIterationMarkers = historyReady ? HISTORY_MARKERS : [];
+  const isArchived = typeof live_time === 'string' && live_time.toLowerCase().includes('ended');
+  const historyIterationMarkers = isArchived ? HISTORY_MARKERS : [];
   // Format pattern segments: replace "unknown" with "-" and filter out duplicates
   const formatPatternSegments = (segments: string[] | undefined, fallback: string) => {
     if (!segments || segments.length === 0) {
@@ -157,12 +157,19 @@ export function TokenCell({
   // }
   
   // Get current portfolio value from backend (all calculations on server)
-  const chartSeconds = (!historyReady && Array.isArray(chartData) && chartData.length > 0)
+  const chartSeconds = (Array.isArray(chartData) && chartData.length > 0)
     ? chartData.length
     : null;
-  const chartSecondsLabel = chartSeconds !== null ? `Live ${chartSeconds}s` : null;
-  const statusLabel = chartSecondsLabel || live_time || (historyReady ? 'Ended' : 'Live');
-  const statusColor = historyReady ? '#6b7280' : '#10b981';
+  const liveSecondsNumeric =
+    typeof liveSeconds === 'number' && Number.isFinite(liveSeconds)
+      ? liveSeconds
+      : null;
+  const statusSeconds =
+    chartSeconds !== null
+      ? chartSeconds
+      : liveSecondsNumeric;
+  const statusLabel = statusSeconds !== null ? `${statusSeconds}s` : '0s';
+  const statusColor = isArchived ? '#6b7280' : '#10b981';
 
   const latestPriceFromChart = (Array.isArray(chartData) && chartData.length > 0)
     ? chartData[chartData.length - 1]

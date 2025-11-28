@@ -24,7 +24,7 @@ interface TokenListProps {
     totalTx: number;
     buyTx: number;
     sellTx: number;
-    historyReady: boolean;
+    liveSeconds?: number | null;
     live_time?: string; // Готовий рядок часу життя з сервера
     // Real trading data from wallet_history and tokens table
     entry_token_amount?: number | null;  // Кількість токенів при вході
@@ -86,7 +86,7 @@ export function TokenList({ tokens, showForecast = false }: TokenListProps) {
           totalTx={token.totalTx}
           buyTx={token.buyTx}
           sellTx={token.sellTx}
-          historyReady={token.historyReady}
+          liveSeconds={token.liveSeconds}
           live_time={token.live_time}
           entry_token_amount={token.entry_token_amount}
           entry_price_usd={token.entry_price_usd}
