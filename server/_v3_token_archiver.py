@@ -40,6 +40,25 @@ async def archive_token(token_id: int, *, conn=None) -> Dict[str, Any]:
             await pool.release(conn)
 
 
+async def purge_token(token_id: int, *, conn=None) -> Dict[str, Any]:
+    """
+    Permanently delete token and all related live data (no history copy).
+    Used for very short-lived tokens that never formed a valid entry.
+    """
+    pool = None
+    own_connection = False
+    if conn is None:
+        pool = await get_db_pool()
+        conn = await pool.acquire()
+        own_connection = True
+    try:
+        async with conn.transaction():
+            return await _purge_token_impl(conn, token_id)
+    finally:
+        if own_connection and pool:
+            await pool.release(conn)
+
+
 async def _archive_token_impl(conn, token_id: int) -> Dict[str, Any]:
     """Internal implementation of archive_token (without transaction management)."""
     # CRITICAL: Check for open position before archiving
@@ -154,6 +173,46 @@ async def _archive_token_impl(conn, token_id: int) -> Dict[str, Any]:
         "token_id": token_id,
         "moved_metrics": metrics_count,
         "moved_trades": trades_count,
+        "deleted_metrics": deleted_metrics,
+        "deleted_trades": deleted_trades,
+        "deleted_tokens": deleted_tokens,
+    }
+
+
+async def _purge_token_impl(conn, token_id: int) -> Dict[str, Any]:
+    """Internal implementation of purge_token."""
+    open_pos_check = await conn.fetchrow(
+        """
+        SELECT id FROM wallet_history
+        WHERE token_id=$1 AND exit_iteration IS NULL
+        LIMIT 1
+        """,
+        token_id
+    )
+    if open_pos_check:
+        return {"success": False, "message": "Cannot purge token with open position", "token_id": token_id}
+
+    deleted_wallet_history = await conn.fetchval(
+        "WITH d AS (DELETE FROM wallet_history WHERE token_id=$1 RETURNING 1) SELECT COUNT(*) FROM d",
+        token_id,
+    ) or 0
+    deleted_metrics = await conn.fetchval(
+        "WITH d AS (DELETE FROM token_metrics_seconds WHERE token_id=$1 RETURNING 1) SELECT COUNT(*) FROM d",
+        token_id,
+    ) or 0
+    deleted_trades = await conn.fetchval(
+        "WITH d AS (DELETE FROM trades WHERE token_id=$1 RETURNING 1) SELECT COUNT(*) FROM d",
+        token_id,
+    ) or 0
+    deleted_tokens = await conn.fetchval(
+        "WITH d AS (DELETE FROM tokens WHERE id=$1 RETURNING 1) SELECT COUNT(*) FROM d",
+        token_id,
+    ) or 0
+
+    return {
+        "success": True,
+        "token_id": token_id,
+        "deleted_wallet_history": deleted_wallet_history,
         "deleted_metrics": deleted_metrics,
         "deleted_trades": deleted_trades,
         "deleted_tokens": deleted_tokens,

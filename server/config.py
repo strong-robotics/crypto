@@ -150,7 +150,8 @@ class Config:
     PRICE_CORRIDOR_FINAL_DROP_THRESHOLD = 0.20  # 20% drop
     PRICE_CORRIDOR_FINAL_RECOVERY_MIN = 0.40    # 40% recovery
     PRICE_CORRIDOR_PATTERN_PREFIX = "corridor_drop"
-    
+    ARCHIVE_MIN_ITERATIONS = 700  # Minimum iterations to archive instead of purge
+
     # Post-entry drop detection: if price drops significantly after entry point (155-170s)
     # This prevents buying tokens that look good at entry but crash immediately after
     POST_ENTRY_DROP_THRESHOLD = 0.15  # 15% drop after entry point (155s) triggers "not" decision

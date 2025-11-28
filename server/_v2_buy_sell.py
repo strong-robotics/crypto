@@ -7,7 +7,7 @@ import asyncio
 import base64
 import json
 import random
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 import aiohttp
 from solders.keypair import Keypair
@@ -15,7 +15,7 @@ from solders.transaction import VersionedTransaction
 from _v3_db_pool import get_db_pool
 from config import config
 from _v2_sol_price import get_current_sol_price
-from _v3_token_archiver import archive_token
+from _v3_token_archiver import archive_token, purge_token
 from _v3_db_utils import get_token_iterations_count
 from _v3_trade_type_checker import check_token_has_real_trading
 
@@ -49,6 +49,18 @@ BASE_TX_FEE_LAMPORTS = 5000
 # Rate limiting для Jupiter API: максимум 1 запит в секунду
 _jupiter_rate_limiter = asyncio.Semaphore(1)
 _last_jupiter_request_time = 0.0
+
+
+async def _archive_or_purge_token(conn, token_id: int, iteration_count: Optional[int] = None) -> Dict[str, Any]:
+    """Archive tokens with sufficient life; otherwise purge them completely."""
+    threshold = int(getattr(config, "ARCHIVE_MIN_ITERATIONS", 700))
+    if iteration_count is None or iteration_count < 0:
+        iteration_count = await get_token_iterations_count(conn, token_id)
+    if iteration_count >= threshold:
+        result = await archive_token(token_id, conn=conn)
+        return {"action": "archive", "result": result}
+    result = await purge_token(token_id, conn=conn)
+    return {"action": "purge", "result": result}
 
 async def _wait_for_jupiter_rate_limit():
     """Чекати між запитами до Jupiter API (максимум 1 запит в секунду)"""
@@ -1171,11 +1183,14 @@ async def sell_real(token_id: int, *, source: str = 'auto_sell', simulate: bool 
             if not token_exists:
                 return {"success": True, "message": "Token already deleted (no open position to sell)", "token_id": token_id}
             
-            try:
-                archive_result = await archive_token(token_id, conn=conn)
-            except Exception:
-                archive_result = {"success": False, "message": "archive_token exception"}
-            return {"success": True, "message": "Token archived (no open position to sell)", "token_id": token_id, "archive": archive_result}
+            iterations = await get_token_iterations_count(conn, token_id)
+            archive_info = await _archive_or_purge_token(conn, token_id, iterations)
+            result_payload = archive_info.get("result", {})
+            success_flag = bool(result_payload.get("success"))
+            message = "Token archived (no open position to sell)" if archive_info["action"] == "archive" else "Token purged (short lifespan)"
+            if not success_flag:
+                return {"success": False, "message": result_payload.get("message", message), "token_id": token_id, archive_info["action"]: result_payload}
+            return {"success": True, "message": message, "token_id": token_id, archive_info["action"]: result_payload}
         
         wallet_id_value = history_row.get("wallet_id")
         if not wallet_id_value:
@@ -1480,22 +1495,25 @@ async def finalize_token_sale(token_id: int, conn, reason: str = 'auto') -> bool
                 )
             except Exception:
                 pass
-        # Clear wallet binding before archiving
-        await conn.execute(
-            """
-            UPDATE tokens
-            SET wallet_id = NULL,
-                token_updated_at = CURRENT_TIMESTAMP
-            WHERE id=$1
-            """,
-            token_id
-        )
-        # Archive token directly (moves to tokens_history and removes from tokens)
-        try:
-            await archive_token(token_id, conn=conn)
-        except Exception:
-            pass
-        return True
+            # Clear wallet binding before archiving
+            await conn.execute(
+                """
+                UPDATE tokens
+                SET wallet_id = NULL,
+                    token_updated_at = CURRENT_TIMESTAMP
+                WHERE id=$1
+                """,
+                token_id
+            )
+            # Archive token directly (moves to tokens_history and removes from tokens)
+            try:
+                await archive_token(token_id, conn=conn)
+            except Exception:
+                pass
+            return True
+        else:
+            archive_info = await _archive_or_purge_token(conn, token_id)
+            return bool(archive_info.get("result", {}).get("success", False))
     except Exception:
         return False
 
