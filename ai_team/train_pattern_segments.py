@@ -12,7 +12,6 @@ import sys
 from typing import Dict, List, Optional
 
 import numpy as np
-import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
@@ -35,6 +34,8 @@ from server.ai.pattern_segments import (
 
 MODEL_PATH = ROOT / "models" / "pattern_segments.pkl"
 META_PATH = ROOT / "models" / "pattern_segments_meta.json"
+MANUAL_LABELS_PATH = ROOT / "ai_team" / "data" / "manual_segment_labels.json"
+SERIES_LIMIT = max(bound[1] for bound in SEGMENT_BOUNDS) + 200
 
 
 def normalize_label(label: Optional[str]) -> Optional[str]:
@@ -73,9 +74,9 @@ async def fetch_segment_dataset() -> List[Dict[str, float]]:
                 FROM token_metrics_seconds_history
                 WHERE token_id=$1 AND usd_price IS NOT NULL
                 ORDER BY ts ASC
-                LIMIT 150
+                LIMIT $2
                 """,
-                token_id,
+                token_id, int(SERIES_LIMIT),
             )
             if not metrics:
                 continue
@@ -103,13 +104,69 @@ async def fetch_segment_dataset() -> List[Dict[str, float]]:
     return dataset
 
 
+async def fetch_manual_dataset(labels: Dict[int, Dict[str, object]]) -> List[Dict[str, float]]:
+    pool = await get_db_pool()
+    dataset: List[Dict[str, float]] = []
+    async with pool.acquire() as conn:
+        for token_id, payload in labels.items():
+            segments_labels: List[str] = payload.get("segments") or []  # type: ignore
+            if not segments_labels:
+                continue
+            rows = await conn.fetch(
+                """
+                SELECT usd_price, buy_count, sell_count
+                FROM token_metrics_seconds_history
+                WHERE token_id=$1 AND usd_price IS NOT NULL
+                ORDER BY ts ASC
+                LIMIT $2
+                """,
+                int(token_id),
+                int(SERIES_LIMIT),
+            )
+            if not rows:
+                rows = await conn.fetch(
+                    """
+                    SELECT usd_price, buy_count, sell_count
+                    FROM token_metrics_seconds
+                    WHERE token_id=$1 AND usd_price IS NOT NULL
+                    ORDER BY ts ASC
+                    LIMIT $2
+                    """,
+                    int(token_id),
+                    int(SERIES_LIMIT),
+                )
+            if not rows:
+                continue
+            series = extract_series(rows)
+            segment_dicts = feature_vector_for_segments(series)
+            if not segment_dicts:
+                continue
+            for idx, seg_label in enumerate(segments_labels):
+                label = normalize_label(seg_label)
+                if label in (None, "unknown"):
+                    continue
+                if idx >= len(segment_dicts):
+                    continue
+                feats = segment_dicts[idx]
+                if feats is None:
+                    continue
+                record = {
+                    "token_id": int(token_id),
+                    "segment_index": idx + 1,
+                }
+                for key in SEGMENT_FEATURE_KEYS:
+                    record[key] = float(feats.get(key, 0.0))
+                record["label"] = label
+                dataset.append(record)
+    return dataset
+
+
 def train_model(dataset: List[Dict[str, float]]):
     if not dataset:
         raise RuntimeError("Dataset пуст — нет данных для обучения")
-    df = pd.DataFrame(dataset)
     feature_names = ["segment_index"] + SEGMENT_FEATURE_KEYS
-    X = df[feature_names].values
-    y_raw = df["label"].values
+    X = np.array([[float(rec.get(name, 0.0)) for name in feature_names] for rec in dataset], dtype=np.float64)
+    y_raw = np.array([rec["label"] for rec in dataset])
     encoder = LabelEncoder()
     y = encoder.fit_transform(y_raw)
     X_train, X_test, y_train, y_test = train_test_split(
@@ -155,8 +212,21 @@ def train_model(dataset: List[Dict[str, float]]):
 
 
 async def main():
-    dataset = await fetch_segment_dataset()
-    print(f"Подготовлено {len(dataset)} сегментов для обучения")
+    dataset: List[Dict[str, float]] = []
+    manual_labels = {}
+    if MANUAL_LABELS_PATH.exists():
+        manual_labels = json.loads(MANUAL_LABELS_PATH.read_text())
+        manual_labels = {
+            int(token_id): payload for token_id, payload in manual_labels.items()
+        }
+        manual_dataset = await fetch_manual_dataset(manual_labels)
+        print(f"✅ Загружено {len(manual_dataset)} сегментов из ручной разметки")
+        dataset.extend(manual_dataset)
+    if not dataset:
+        dataset = await fetch_segment_dataset()
+        print(f"⚠️ Ручная разметка отсутствует — используем БД ({len(dataset)} сегментов)")
+    else:
+        print(f"Итого сегментов для обучения: {len(dataset)}")
     train_model(dataset)
 
 

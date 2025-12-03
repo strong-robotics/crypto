@@ -13,6 +13,7 @@ from config import config
 from _v3_pair_resolver import resolve_and_update_pair
 from ai.patterns.catalog import PATTERN_SEED
 from ai.pattern_segments import (
+    SEGMENT_BOUNDS,
     SEGMENT_FEATURE_KEYS,
     feature_vector_for_segments,
     extract_series,
@@ -55,7 +56,7 @@ class JupiterAnalyzerV3:
         self.withdraw_check_iter: int = int(getattr(config, 'AUTO_BUY_ENTRY_SEC', 150))
         self.withdraw_window: int = int(getattr(config, 'LIQUIDITY_WITHDRAW_WINDOW', 10))
         self.withdraw_equal_eps: float = float(getattr(config, 'LIQUIDITY_WITHDRAW_EQUAL_EPS', 1e-6))
-        self.segment_series_limit: int = max(150, self.withdraw_check_iter + self.withdraw_window)
+        self.segment_series_limit: int = max(1000, self.withdraw_check_iter + self.withdraw_window)
 
         # Track last trade-type checkpoint per token (0/35/85/170) to avoid spamming Helius
         self.trade_check_done = {}
@@ -137,12 +138,12 @@ class JupiterAnalyzerV3:
         return label
 
     def _detect_post_entry_drop(self, prices: List[float], entry_sec: int, post_entry_end: int, drop_threshold: float = 0.15) -> bool:
-        """Detect if there's a significant price drop after entry point (155s).
+        """Detect if there's a significant price drop after entry point.
         
         Args:
             prices: List of prices from token start (index = second)
-            entry_sec: Entry point in seconds (AUTO_BUY_ENTRY_SEC, typically 155)
-            post_entry_end: End of post-entry window (typically 170)
+            entry_sec: Entry point in seconds (AUTO_BUY_ENTRY_SEC)
+            post_entry_end: End of post-entry window (final corridor end)
             drop_threshold: Minimum drop percentage to consider significant (default 15%)
         
         Returns:
@@ -282,10 +283,16 @@ class JupiterAnalyzerV3:
         if not rows:
             return None
         series = extract_series(rows)
+        iterations_count: Optional[int] = None
+        try:
+            iterations_count = await get_token_iterations_count(conn, token_id)
+        except Exception:
+            iterations_count = None
         segment_dicts = feature_vector_for_segments(series)
         predicted: List[str] = []
         for idx, feats in enumerate(segment_dicts):
-            if feats is None:
+            segment_end = SEGMENT_BOUNDS[idx][1]
+            if iterations_count is None or iterations_count < segment_end or feats is None:
                 predicted.append("unknown")
                 continue
             vec = [float(idx + 1)] + [float(feats.get(key, 0.0)) for key in SEGMENT_FEATURE_KEYS]
@@ -298,10 +305,11 @@ class JupiterAnalyzerV3:
         # Check at three points: after segment 1 (35s), segment 2 (85s), and segment 3 (170s)
         # This prevents entering tokens that only have transfers (no real market)
         try:
-            iterations_count = await get_token_iterations_count(conn, token_id)
+            if iterations_count is None:
+                iterations_count = await get_token_iterations_count(conn, token_id)
             
-            # Check points: 35s (end of segment 1), 85s (end of segment 2), 170s (end of segment 3)
-            check_points = [35, 85, 170]
+            # Check points: segment boundaries (250s, 700s, 1000s)
+            check_points = [250, 700, 1000]
             
             # Determine which check point we're at
             current_check_point = None
@@ -957,7 +965,6 @@ class JupiterAnalyzerV3:
                 zero_tail = int(getattr(config, 'ZERO_TAIL_CONSEC_SEC', 20))
                 try:
                     if zero_tail > 0:
-                        # Check if last N consecutive seconds have zero/NULL price and mcap
                         row = await conn.fetchrow(
                             """
                             WITH last AS (
@@ -975,9 +982,6 @@ class JupiterAnalyzerV3:
                         )
                         pos_cnt = int(row['pos_cnt'] or 0) if row else 0
                         total = int(row['total'] or 0) if row else 0
-                        
-                        # Also check for flat mcap/price (liquidity withdrawal detection)
-                        # If mcap/price is flat (same values) in recent window, it's also a sign of liquidity withdrawal
                         total_points = int(
                             await conn.fetchval(
                                 """
@@ -989,27 +993,7 @@ class JupiterAnalyzerV3:
                             )
                             or 0
                         )
-                        is_flat = False
-                        # New: skip zero-liquidity guard for first N seconds to avoid premature exits
-                        min_lifetime = int(getattr(config, 'ZERO_LIQ_MIN_LIFETIME_SEC', 0))
-                        if total_points >= max(min_lifetime, 0):
-                            if total_points >= self.withdraw_check_iter:
-                                recent_rows = await conn.fetch(
-                                    """
-                                    SELECT usd_price, mcap
-                                    FROM token_metrics_seconds
-                                    WHERE token_id=$1
-                                    ORDER BY ts DESC
-                                    LIMIT $2
-                                    """,
-                                    token_id,
-                                    self.withdraw_window,
-                                )
-                                withdraw_iter = self._detect_liquidity_withdraw(total_points, recent_rows)
-                                is_flat = (withdraw_iter is not None)
-                        
-                        if (total >= zero_tail and pos_cnt == 0) or is_flat:
-                            # Check if there is an open position in wallet_history
+                        if total >= zero_tail and pos_cnt == 0:
                             open_position = await conn.fetchrow(
                                 """
                                 SELECT id, wallet_id, entry_token_amount
@@ -1019,28 +1003,23 @@ class JupiterAnalyzerV3:
                                 """,
                                 token_id
                             )
-                            
-                            if open_position:
-                                # Wallet вошёл в токен – не закрываем позицию автоматически.
-                                # Zero-tail guard пропускаем, чтобы не продавать живые токены
-                                # при коротких паузах обновления цены.
+                            zero_tail_triggered = True
+                            try:
+                                await conn.execute(
+                                    """
+                                    UPDATE tokens
+                                    SET zero_tail_detected_iter = COALESCE(zero_tail_detected_iter, $2),
+                                        cleaner_flagged = TRUE,
+                                        cleaner_flag_reason = 'zero_tail',
+                                        cleaner_flag_iteration = COALESCE(cleaner_flag_iteration, $2),
+                                        cleaner_flagged_at = CURRENT_TIMESTAMP
+                                    WHERE id = $1
+                                    """,
+                                    token_id,
+                                    total_points,
+                                )
+                            except Exception:
                                 pass
-                            else:
-                                zero_tail_triggered = True
-                                try:
-                                    await conn.execute(
-                                        """
-                                        UPDATE tokens
-                                        SET zero_tail_detected_iter = COALESCE(zero_tail_detected_iter, $2)
-                                        WHERE id = $1
-                                        """,
-                                        token_id,
-                                        total_points,
-                                    )
-                                except Exception:
-                                    pass
-                                # if self.debug:
-                                    # print(f"[Analyzer] ⚠️ Zero-liquidity detected for token {token_id} without open position - keeping token alive for monitoring")
                 except Exception:
                     pass
                 finally:
@@ -1057,7 +1036,51 @@ class JupiterAnalyzerV3:
                         except Exception:
                             pass
 
-                # NOTE: Frozen guard removed - analyzer only handles zero-liquidity detection
+                # Frozen price detection: цена не менялась N итераций
+                frozen_triggered = False
+                frozen_window = int(getattr(config, 'FROZEN_PRICE_CONSEC_SEC', 0))
+                try:
+                    if frozen_window > 0:
+                        price_rows = await conn.fetch(
+                            """
+                            SELECT usd_price
+                            FROM token_metrics_seconds
+                            WHERE token_id=$1 AND usd_price IS NOT NULL AND usd_price>0
+                            ORDER BY ts DESC
+                            LIMIT $2
+                            """,
+                            token_id,
+                            frozen_window,
+                        )
+                        if len(price_rows) == frozen_window:
+                            prices = [float(r['usd_price']) for r in price_rows]
+                            eps = float(getattr(config, 'FROZEN_PRICE_EQUAL_EPS', 1e-10) or 0.0)
+                            if max(prices) - min(prices) <= max(eps, 0.0):
+                                total_points = int(
+                                    await conn.fetchval(
+                                        "SELECT COUNT(*) FROM token_metrics_seconds WHERE token_id=$1",
+                                        token_id,
+                                    )
+                                    or 0
+                                )
+                                frozen_triggered = True
+                                try:
+                                    await conn.execute(
+                                        """
+                                        UPDATE tokens
+                                        SET cleaner_flagged = TRUE,
+                                            cleaner_flag_reason = 'frozen_price',
+                                            cleaner_flag_iteration = COALESCE(cleaner_flag_iteration, $2),
+                                            cleaner_flagged_at = CURRENT_TIMESTAMP
+                                        WHERE id = $1
+                                        """,
+                                        token_id,
+                                        total_points,
+                                    )
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
 
                 # AUTO-SELL: Check if current portfolio value >= entry_amount * (1 + TARGET_RETURN)
                 # This works independently from AI plan (plan_sell_iteration/plan_sell_price_usd)

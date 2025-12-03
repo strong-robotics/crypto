@@ -63,6 +63,54 @@ async def init_database():
             pass
         try:
             await conn.execute(
+                "ALTER TABLE tokens ADD COLUMN IF NOT EXISTS cleaner_flagged BOOLEAN DEFAULT FALSE"
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                "ALTER TABLE tokens ADD COLUMN IF NOT EXISTS cleaner_flag_reason TEXT"
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                "ALTER TABLE tokens ADD COLUMN IF NOT EXISTS cleaner_flag_iteration INTEGER"
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                "ALTER TABLE tokens ADD COLUMN IF NOT EXISTS cleaner_flagged_at TIMESTAMP"
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                "ALTER TABLE tokens_history ADD COLUMN IF NOT EXISTS cleaner_flagged BOOLEAN DEFAULT FALSE"
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                "ALTER TABLE tokens_history ADD COLUMN IF NOT EXISTS cleaner_flag_reason TEXT"
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                "ALTER TABLE tokens_history ADD COLUMN IF NOT EXISTS cleaner_flag_iteration INTEGER"
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                "ALTER TABLE tokens_history ADD COLUMN IF NOT EXISTS cleaner_flagged_at TIMESTAMP"
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute(
                 "ALTER TABLE token_metrics_seconds ADD COLUMN IF NOT EXISTS median_amount_sol TEXT"
             )
         except Exception:
@@ -407,6 +455,26 @@ async def init_database():
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_history_archived_at ON tokens_history(archived_at)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_history_token_id ON token_metrics_seconds_history(token_id)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_history_token_id ON trades_history(token_id)")
+        except Exception:
+            pass
+        # Bad tokens archive (for removed scam/spam tokens)
+        try:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bad_tokens (
+                    LIKE tokens INCLUDING ALL,
+                    removed_reason TEXT,
+                    removed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bad_token_metrics (
+                    LIKE token_metrics_seconds INCLUDING ALL
+                )
+                """
+            )
         except Exception:
             pass
         

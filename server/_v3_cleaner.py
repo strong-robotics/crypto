@@ -21,13 +21,22 @@ Usage examples:
 
 import argparse
 import asyncio
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from config import config
 from _v3_db_pool import get_db_pool
 from _v3_token_archiver import archive_token
+FLAG_COLUMNS = [
+    ("cleaner_flagged", "BOOLEAN DEFAULT FALSE"),
+    ("cleaner_flag_reason", "TEXT"),
+    ("cleaner_flag_iteration", "INTEGER"),
+    ("cleaner_flagged_at", "TIMESTAMPTZ"),
+]
+
+_FLAG_COLUMNS_ENSURED = False
+_BAD_TABLES_ENSURED = False
 
 
 ADVISORY_LOCK_KEY = 0x76635F636C65616E  # arbitrary "v3_clean" key
@@ -127,32 +136,6 @@ async def _find_low_holder_tokens(
     return [int(r["id"]) for r in rows]
 
 
-async def _find_zero_tail_tokens(conn, delay_iters: int, limit: int) -> List[int]:
-    """Find tokens flagged by zero-tail guard (no entry) after configurable delay."""
-    if limit <= 0 or delay_iters < 0:
-        return []
-    rows = await conn.fetch(
-        """
-        WITH metric_counts AS (
-            SELECT token_id, COUNT(*) AS cnt
-            FROM token_metrics_seconds
-            GROUP BY token_id
-        )
-        SELECT t.id
-        FROM tokens t
-        JOIN metric_counts mc ON mc.token_id = t.id
-        WHERE t.zero_tail_detected_iter IS NOT NULL
-          AND mc.cnt - t.zero_tail_detected_iter >= $2
-          AND t.wallet_id IS NULL
-        ORDER BY mc.cnt DESC
-        LIMIT $1
-        """,
-        limit,
-        delay_iters,
-    )
-    return [int(r["id"]) for r in rows]
-
-
 async def _find_no_swap_tokens(conn, limit: int) -> List[int]:
     """Find tokens flagged как no_swap_after_second_corridor."""
     if limit <= 0:
@@ -230,10 +213,165 @@ async def _purge_batch(conn, ids: List[int]) -> Tuple[int, int, int]:
     return (_n(m), _n(t), _n(x))
 
 
+async def _ensure_flag_columns(conn) -> None:
+    global _FLAG_COLUMNS_ENSURED
+    if _FLAG_COLUMNS_ENSURED:
+        return
+    for column, definition in FLAG_COLUMNS:
+        await conn.execute(
+            f"ALTER TABLE tokens ADD COLUMN IF NOT EXISTS {column} {definition}"
+        )
+    _FLAG_COLUMNS_ENSURED = True
+
+
+async def _flag_tokens(conn, ids: List[int], reason: str) -> int:
+    if not ids:
+        return 0
+    rows = await conn.fetch(
+        """
+        SELECT token_id, COUNT(*) AS cnt
+        FROM token_metrics_seconds
+        WHERE token_id = ANY($1)
+        GROUP BY token_id
+        """,
+        ids,
+    )
+    counts: Dict[int, int] = {int(r["token_id"]): int(r["cnt"] or 0) for r in rows}
+    total = 0
+    for tid in ids:
+        iter_count = counts.get(tid, 0)
+        await conn.execute(
+            """
+            UPDATE tokens
+            SET cleaner_flagged = TRUE,
+                cleaner_flag_reason = $2,
+                cleaner_flag_iteration = $3,
+                cleaner_flagged_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            """,
+            tid,
+            reason,
+            iter_count,
+        )
+        total += 1
+    return total
+
+
+async def _get_iteration_counts(conn, ids: List[int]) -> Dict[int, int]:
+    if not ids:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT token_id, COUNT(*) AS cnt
+        FROM token_metrics_seconds
+        WHERE token_id = ANY($1)
+        GROUP BY token_id
+        """,
+        ids,
+    )
+    return {int(r["token_id"]): int(r["cnt"] or 0) for r in rows}
+
+
+async def _process_flagged_tokens(conn, ids: List[int], reason: str, archive_threshold: int) -> Tuple[int, int]:
+    if not ids:
+        return (0, 0)
+    counts = await _get_iteration_counts(conn, ids)
+    archive_ids: List[int] = []
+    bad_ids: List[int] = []
+    for tid in ids:
+        iter_count = counts.get(tid, 0)
+        if archive_threshold > 0 and iter_count >= archive_threshold:
+            archive_ids.append(tid)
+        else:
+            bad_ids.append(tid)
+    archived = 0
+    if archive_ids:
+        for tid in archive_ids:
+            try:
+                res = await archive_token(tid, conn=conn)
+                if res.get("success"):
+                    archived += 1
+            except Exception:
+                pass
+    removed = 0
+    if bad_ids:
+        removed = await _move_to_bad_tables(conn, bad_ids, reason)
+    return archived, removed
+
+
+async def _find_flagged_tokens(conn, reason: str, limit: int) -> List[int]:
+    if limit <= 0:
+        return []
+    rows = await conn.fetch(
+        """
+        SELECT id
+        FROM tokens
+        WHERE cleaner_flagged = TRUE
+          AND cleaner_flag_reason = $1
+        ORDER BY cleaner_flagged_at ASC NULLS LAST
+        LIMIT $2
+        """,
+        reason,
+        limit,
+    )
+    return [int(r["id"]) for r in rows]
+
+
+async def _ensure_bad_tables(conn) -> None:
+    global _BAD_TABLES_ENSURED
+    if _BAD_TABLES_ENSURED:
+        return
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bad_tokens (
+            LIKE tokens INCLUDING ALL,
+            removed_reason TEXT,
+            removed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bad_token_metrics (
+            LIKE token_metrics_seconds INCLUDING ALL
+        )
+        """
+    )
+    _BAD_TABLES_ENSURED = True
+
+
+async def _move_to_bad_tables(conn, ids: List[int], reason: str) -> int:
+    if not ids:
+        return 0
+    await conn.execute(
+        """
+        INSERT INTO bad_tokens
+        SELECT t.*, $2 AS removed_reason, CURRENT_TIMESTAMP AS removed_at
+        FROM tokens t
+        WHERE t.id = ANY($1)
+        """,
+        ids,
+        reason,
+    )
+    await conn.execute(
+        """
+        INSERT INTO bad_token_metrics
+        SELECT *
+        FROM token_metrics_seconds
+        WHERE token_id = ANY($1)
+        """,
+        ids,
+    )
+    await _purge_batch(conn, ids)
+    return len(ids)
+
+
 async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int = 200,
                       no_entry_age_sec: int = 0, no_entry_iters: int = 80) -> dict:
     pool = await get_db_pool()
     async with pool.acquire() as conn:
+        await _ensure_flag_columns(conn)
+        await _ensure_bad_tables(conn)
         locked = await _acquire_lock(conn)
         if not locked:
             return {"success": False, "message": "another cleaner is running"}
@@ -241,37 +379,59 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
             holder_iter_threshold = int(getattr(config, "CLEANER_LOW_HOLDER_ITER_THRESHOLD", 0) or 0)
             holder_min_count = int(getattr(config, "CLEANER_LOW_HOLDER_MIN_COUNT", 0) or 0)
             holder_archive_ids: List[int] = []
-            holder_archived = 0
             if holder_iter_threshold > 0 and holder_min_count > 0:
                 holder_archive_ids = await _find_low_holder_tokens(
                     conn, holder_iter_threshold, holder_min_count, limit
                 )
-                if not dry_run and holder_archive_ids:
-                    for tid in holder_archive_ids:
-                        try:
-                            res = await archive_token(tid, conn=conn)
-                            if res.get("success"):
-                                holder_archived += 1
-                        except Exception:
-                            pass
 
             ids: List[int] = []
             remaining = limit
             zero_tail_candidates: List[int] = []
-
-            zero_tail_delay = int(getattr(config, "CLEANER_ZERO_TAIL_DELETE_DELAY", 0) or 0)
-            if zero_tail_delay >= 0:
-                zero_tail_candidates = await _find_zero_tail_tokens(conn, zero_tail_delay, remaining)
-                ids.extend(zero_tail_candidates)
-                remaining = max(0, limit - len(ids))
+            bad_removed: Dict[str, int] = {}
+            archived_summary: Dict[str, int] = {}
+            archive_threshold = int(getattr(config, "ARCHIVE_MIN_ITERATIONS", 0) or 0)
 
             flagged_ids = await _find_no_swap_tokens(conn, remaining)
-            ids.extend(flagged_ids)
-            remaining = max(0, limit - len(ids))
+            if flagged_ids:
+                if dry_run:
+                    ids.extend(flagged_ids)
+                else:
+                    await _purge_batch(conn, flagged_ids)
+                    bad_removed["no_swap"] = bad_removed.get("no_swap", 0) + len(flagged_ids)
+                remaining = max(0, remaining - len(flagged_ids))
 
             no_pair_ids = await _find_no_pair_tokens(conn, older_than_sec, remaining)
-            ids.extend(no_pair_ids)
-            remaining = max(0, limit - len(ids))
+            if no_pair_ids:
+                if dry_run:
+                    ids.extend(no_pair_ids)
+                else:
+                    await _purge_batch(conn, no_pair_ids)
+                    bad_removed["no_pair"] = bad_removed.get("no_pair", 0) + len(no_pair_ids)
+                remaining = max(0, remaining - len(no_pair_ids))
+
+            zero_tail_candidates = await _find_flagged_tokens(conn, "zero_tail", remaining)
+            if zero_tail_candidates:
+                if dry_run:
+                    ids.extend(zero_tail_candidates)
+                else:
+                    archived, removed = await _process_flagged_tokens(conn, zero_tail_candidates, "zero_tail", archive_threshold)
+                    if archived:
+                        archived_summary["zero_tail"] = archived_summary.get("zero_tail", 0) + archived
+                    if removed:
+                        bad_removed["zero_tail"] = bad_removed.get("zero_tail", 0) + removed
+                remaining = max(0, remaining - len(zero_tail_candidates))
+
+            frozen_candidates = await _find_flagged_tokens(conn, "frozen_price", remaining)
+            if frozen_candidates:
+                if dry_run:
+                    ids.extend(frozen_candidates)
+                else:
+                    archived, removed = await _process_flagged_tokens(conn, frozen_candidates, "frozen_price", archive_threshold)
+                    if archived:
+                        archived_summary["frozen_price"] = archived_summary.get("frozen_price", 0) + archived
+                    if removed:
+                        bad_removed["frozen_price"] = bad_removed.get("frozen_price", 0) + removed
+                remaining = max(0, remaining - len(frozen_candidates))
 
             no_price_ids = await _find_no_price_tokens(conn, remaining)
             ids.extend(no_price_ids)
@@ -280,38 +440,41 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
             orphan_ids = await _find_candidates(conn, older_than_sec, remaining)
             ids.extend(orphan_ids)
 
-            ids = list(dict.fromkeys(ids))  # deduplicate preserving order
-            total_candidates = len(holder_archive_ids) + len(ids)
+            ids = list(dict.fromkeys(ids))
+            extra_processed = 0 if dry_run else (len(zero_tail_candidates) + len(frozen_candidates))
+            total_candidates = len(holder_archive_ids) + len(ids) + extra_processed
             if total_candidates == 0:
-                result = {"success": True, "found": 0, "deleted": 0}
-                if holder_archive_ids:
-                    result["holder_candidates"] = holder_archive_ids[:10]
-                if zero_tail_candidates:
-                    result["zero_tail_candidates"] = zero_tail_candidates[:10]
-                return result
+                return {"success": True, "found": 0, "flagged": 0, "removed_to_bad": {}, "archived": {}}
             if dry_run:
-                res = {
+                return {
                     "success": True,
                     "found": total_candidates,
-                    "deleted": 0,
+                    "flagged": 0,
                     "ids": ids[:10],
+                    "removed_to_bad": {},
+                    "archived": {},
                 }
-                if holder_archive_ids:
-                    res["holder_candidates"] = holder_archive_ids[:10]
-                if zero_tail_candidates:
-                    res["zero_tail_candidates"] = zero_tail_candidates[:10]
-                return res
-            # Purge in a transaction
-            async with conn.transaction():
-                m, t, x = await _purge_batch(conn, ids)
+            summary: Dict[str, int] = {}
+            flagged_total = 0
+            if no_price_ids:
+                count = await _flag_tokens(conn, no_price_ids, "no_price")
+                summary["no_price"] = count
+                flagged_total += count
+            if orphan_ids:
+                count = await _flag_tokens(conn, orphan_ids, "orphan")
+                summary["orphan"] = count
+                flagged_total += count
+            if holder_archive_ids:
+                count = await _flag_tokens(conn, holder_archive_ids, "low_holders")
+                summary["low_holders"] = count
+                flagged_total += count
             return {
                 "success": True,
                 "found": total_candidates,
-                "deleted": x,
-                "metrics_deleted": m,
-                "trades_deleted": t,
-                "archived": holder_archived,
-                "zero_tail_deleted": len(zero_tail_candidates),
+                "flagged": flagged_total,
+                "summary": summary,
+                "removed_to_bad": bad_removed,
+                "archived": archived_summary,
             }
         finally:
             await _release_lock(conn)
@@ -320,21 +483,31 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
 async def run_until_empty(dry_run: bool, older_than_sec: int, limit: int,
                           no_entry_age_sec: int = 0, no_entry_iters: int = 80) -> dict:
     total_found = 0
-    total_deleted = 0
-    total_m = 0
-    total_t = 0
+    total_flagged = 0
+    removed_summary: Dict[str, int] = {}
+    archived_summary: Dict[str, int] = {}
     while True:
         res = await run_cleanup(dry_run=dry_run, older_than_sec=older_than_sec, limit=limit,
                                 no_entry_age_sec=no_entry_age_sec, no_entry_iters=no_entry_iters)
         if not res.get("success"):
             return res
         total_found += res.get("found", 0)
-        total_deleted += res.get("deleted", 0)
-        total_m += res.get("metrics_deleted", 0)
-        total_t += res.get("trades_deleted", 0)
+        total_flagged += res.get("flagged", 0)
+        removed = res.get("removed_to_bad") or {}
+        for key, value in removed.items():
+            removed_summary[key] = removed_summary.get(key, 0) + value
+        archived = res.get("archived") or {}
+        for key, value in archived.items():
+            archived_summary[key] = archived_summary.get(key, 0) + value
         if res.get("found", 0) == 0 or dry_run:
             break
-    return {"success": True, "found": total_found, "deleted": total_deleted, "metrics_deleted": total_m, "trades_deleted": total_t}
+    return {
+        "success": True,
+        "found": total_found,
+        "flagged": total_flagged,
+        "removed_to_bad": removed_summary,
+        "archived": archived_summary,
+    }
 
 
 def _parse_args() -> argparse.Namespace:

@@ -6,9 +6,9 @@ import numpy as np
 
 
 SEGMENT_BOUNDS = [
-    (0, 35),   # Segment 1: birth -> first corridor
-    (35, 85),  # Segment 2: between first and second corridor
-    (85, 170), # Segment 3: final window before exit (extended to 170s to detect post-entry drops)
+    (0, 250),    # Segment 1: birth -> first long window
+    (250, 700),  # Segment 2: mid-life window before first corridor
+    (700, 1000), # Segment 3: final growth / exit window
 ]
 
 MIN_POINTS_PER_SEGMENT = 6

@@ -122,7 +122,7 @@ class Config:
     # AUTO-BUY / ENTRY CONFIGURATION
     # ============================================================================
     # Global switch to enable/disable авто-покупку (быстрое тестовое отключение)
-    AUTO_BUY_ENABLED = False
+    AUTO_BUY_ENABLED = True
     # Seconds before auto-buy considers entry (token age threshold)
     # IMPORTANT: Tokens that survive past 2 minutes (120s) are more likely to be legitimate.
     # Tokens that get rug-pulled before 75-120s are scams - we avoid them by waiting.
@@ -130,8 +130,8 @@ class Config:
     # Entry point for both preview forecast and auto-buy
     # Tokens must survive at least this many seconds before entry is allowed
     # Set to 150 seconds (2.5 minutes) - allows time for pattern segments calculation and liquidity check
-    AUTO_BUY_ENTRY_SEC = 171  # seconds before auto-buy triggers
-    AI_PREVIEW_ENTRY_SEC = 171  # seconds to assume for preview forecast (same as auto-buy entry)
+    AUTO_BUY_ENTRY_SEC = 950  # seconds before auto-buy triggers (extended lifespan)
+    AI_PREVIEW_ENTRY_SEC = 950  # seconds to assume for preview forecast (same as auto-buy entry)
     
     # Preview forecast (simulation) - shows potential profit before real entry
     # Set to False to disable preview forecast and only use real trading
@@ -140,17 +140,17 @@ class Config:
     # Corridor guard to detect brutal dumps around entry/final checkpoints
     PRICE_CORRIDOR_GUARD_ENABLED = True
     PRICE_CORRIDOR_PRE_ENABLED = True
-    PRICE_CORRIDOR_PRE_START = 75
-    PRICE_CORRIDOR_PRE_END = 85
+    PRICE_CORRIDOR_PRE_START = 670
+    PRICE_CORRIDOR_PRE_END = 730
     PRICE_CORRIDOR_PRE_DROP_THRESHOLD = 0.18  # 18% drop within the window
     PRICE_CORRIDOR_PRE_RECOVERY_MIN = 0.50    # require at least 50% recovery
     PRICE_CORRIDOR_FINAL_ENABLED = True
-    PRICE_CORRIDOR_FINAL_START = 115
-    PRICE_CORRIDOR_FINAL_END = 170  # Extended to detect post-entry drops (155-170s)
+    PRICE_CORRIDOR_FINAL_START = 940
+    PRICE_CORRIDOR_FINAL_END = 1000  # Extended to detect post-entry drops closer to 1000s
     PRICE_CORRIDOR_FINAL_DROP_THRESHOLD = 0.20  # 20% drop
     PRICE_CORRIDOR_FINAL_RECOVERY_MIN = 0.40    # 40% recovery
     PRICE_CORRIDOR_PATTERN_PREFIX = "corridor_drop"
-    ARCHIVE_MIN_ITERATIONS = 700  # Minimum iterations to archive instead of purge
+    ARCHIVE_MIN_ITERATIONS = 1000  # Archive only if token lived >=1000 iterations; otherwise purge
 
     # Post-entry drop detection: if price drops significantly after entry point (155-170s)
     # This prevents buying tokens that look good at entry but crash immediately after
@@ -217,7 +217,7 @@ class Config:
     ETA_MAX_CAP = 40
     ETA_P_THRESHOLD = 0.6
     ETA_MODEL_PATH = os.path.join('models', 'eta_tcn.pt')
-    ETA_MAX_TOKEN_AGE_SEC = 340
+    ETA_MAX_TOKEN_AGE_SEC = 1000
 
     # Token candidate filters (live)
     MIN_TX_COUNT = 100  # minimal total transactions in window (auto-entry gate)
@@ -243,16 +243,13 @@ class Config:
     # Rug / drained-liquidity guard: if last N consecutive seconds have usd_price NULL/0,
     # consider token dead. If no entry happened yet → hard delete token (+metrics/trades).
     # If entry happened → finalize position at price 0 and archive token.
-    ZERO_TAIL_CONSEC_SEC = 20  # need 20 подряд пустых секунд, чтобы признать токен «мертвым»
+    ZERO_TAIL_CONSEC_SEC = 120  # нужно 120 последовательных пустых итераций, чтобы признать токен «мертвым»
     # Do NOT trigger zero-liquidity guard until token прожил минимум столько секунд.
-    ZERO_LIQ_MIN_LIFETIME_SEC = 220  # токен должен прожить ~220 секунд (итераций) прежде чем включается guard
-    CLEANER_ZERO_TAIL_DELETE_DELAY = 30  # сколько дополнительных итераций ждать перед удалением zero-tail токена
     CLEANER_LOW_HOLDER_ITER_THRESHOLD = 500  # минимальное количество итераций для low-holder архивации
     CLEANER_LOW_HOLDER_MIN_COUNT = 300       # минимальное число холдеров для long-lived токена
-    # Frozen detector: if for the last FROZEN_SEC seconds there are no changes in
-    # price, liquidity and trade counters, auto-close position at 0 and free wallet.
-    FROZEN_SEC = 45
-    FROZEN_MIN_ROWS = 40  # minimal rows in window
+    # Frozen price detector: if последние N итераций цена не менялась → считаем токен замороженным
+    FROZEN_PRICE_CONSEC_SEC = 120  # количество последних итераций, где цена должна быть одинаковой
+    FROZEN_PRICE_EQUAL_EPS = 1e-10  # допуск при сравнении цены
     # Bad pattern guard: archive tokens with bad patterns (black_hole, flatliner, etc.)
     # after this many iterations if no entry. Saves Jupiter API requests on clearly worthless tokens.
     # Keep 100 iterations for future ML training data.
