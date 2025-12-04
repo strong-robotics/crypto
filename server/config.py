@@ -397,7 +397,7 @@ class Config:
     # FILE PATHS (not secrets)
     # ============================================================================
     
-    WALLET_KEYS_FILE = "keys.json"  # Wallet keys for balance monitoring
+    WALLET_KEYS_FILE = os.path.join(BASE_DIR, "server", "keys.json")  # Wallet keys for balance monitoring
     
     # ============================================================================
     # BACKWARD COMPATIBILITY

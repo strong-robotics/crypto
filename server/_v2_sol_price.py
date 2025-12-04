@@ -139,6 +139,8 @@ async def get_sol_price_monitor(update_interval: int = 1, debug: bool = False) -
 def get_current_sol_price() -> float:
     """Получить текущую цену SOL. Возвращает последнее известное значение или 0.0"""
     global _sol_price_monitor_instance
+    fallback = float(getattr(config, "SOL_PRICE_FALLBACK", 0.0) or 0.0)
     if _sol_price_monitor_instance:
-        return _sol_price_monitor_instance.get_price()
-    return 0.0
+        price = _sol_price_monitor_instance.get_price()
+        return price if price > 0 else fallback
+    return fallback

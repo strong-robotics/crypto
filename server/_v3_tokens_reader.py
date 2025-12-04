@@ -67,7 +67,7 @@ class TokensReaderV3:
                     order_clause = "ORDER BY COALESCE(t.archived_at, t.token_updated_at, t.created_at) DESC"
                     archived_at_select = "t.archived_at"
                 else:
-                    order_clause = "ORDER BY t.created_at DESC"
+                    order_clause = "ORDER BY COALESCE(t.holder_count, 0) DESC, t.created_at DESC"
                     archived_at_select = "NULL::timestamp AS archived_at"
                 if self.disable_sort:
                     if use_history:

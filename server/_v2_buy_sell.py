@@ -6,13 +6,38 @@
 import asyncio
 import base64
 import json
+import os
 import random
+import sys
+from pathlib import Path
 from typing import Dict, Optional, Any
 
 import aiohttp
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
-from _v3_db_pool import get_db_pool
+def _maybe_rerun_with_venv(exc: ModuleNotFoundError):
+    """If asyncpg is missing, rerun script using venv python automatically."""
+    if os.environ.get("BUYSELL_SKIP_VENV_RELAUNCH") == "1":
+        raise exc
+    base_dir = Path(__file__).resolve().parents[1]
+    candidates = [
+        base_dir / "venv" / "bin" / "python3",
+        base_dir / "venv" / "bin" / "python",
+        base_dir / "venv" / "Scripts" / "python.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            os.environ["BUYSELL_SKIP_VENV_RELAUNCH"] = "1"
+            os.execv(str(candidate), [str(candidate)] + sys.argv)
+    raise exc
+
+
+try:
+    from _v3_db_pool import get_db_pool, close_db_pool
+except ModuleNotFoundError as exc:
+    if exc.name == "asyncpg":
+        _maybe_rerun_with_venv(exc)
+    raise
 from config import config
 from _v2_sol_price import get_current_sol_price
 from _v3_token_archiver import archive_token, purge_token
@@ -600,7 +625,7 @@ async def execute_buy(
         async with aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT) as session:
             sol_price = get_current_sol_price()
             if sol_price <= 0:
-                return {"success": False, "message": "Failed to get SOL price"}
+                sol_price = 0.0
             
             # Check balance ONLY for real transactions (skip for simulation)
             # In simulation mode, we don't need real balance - transaction is not sent to blockchain
@@ -901,7 +926,7 @@ async def execute_sell(
     token_decimals: int,
     rpc_endpoint: str = HELIUS_RPC,
     sender_endpoint: str = HELIUS_RPC,
-    simulate: bool = False
+    simulate: bool = False,
 ) -> Dict:
     """Універсальна функція для виконання реальної продажі токена через RPC endpoint.
     
@@ -919,43 +944,56 @@ async def execute_sell(
     Returns:
         dict with success, signature, amount_sol, amount_usd, price_usd, etc.
     """
+    skip_price_check = bool(getattr(config, "SELL_SKIP_PRICE_CHECK", False))
+
     try:
         async with aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT) as session:
             sol_price = get_current_sol_price()
             if sol_price <= 0:
                 return {"success": False, "message": "Failed to get SOL price"}
             
-            # Get current token price (Jupiter для аналізу)
-            test_amount = 1000 * (10**token_decimals)
-            
-            # Rate limiting: чекати між запитами до Jupiter
-            await _wait_for_jupiter_rate_limit()
-            
-            async with session.get(
-                f"{JUP}/quote",
-                params={
-                    "inputMint": token_address,
-                    "outputMint": SOL_MINT,
-                    "amount": test_amount,
-                    "slippageBps": 50
-                },
-                timeout=DEFAULT_TIMEOUT,
-            ) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    return {"success": False, "message": f"Price check HTTP error {resp.status}: {text[:200]}"}
-                try:
-                    q_test = await resp.json(content_type=None)
-                except Exception as e:
-                    text = await resp.text()
-                    return {"success": False, "message": f"Price check JSON parse error: {str(e)}, response: {text[:200]}"}
-            
-            if "error" in q_test:
-                return {"success": False, "message": f"Price check error: {q_test.get('error', 'Unknown')}"}
-            
-            sol_out = int(q_test["outAmount"]) / (10**SOL_DECIMALS)
-            token_price_usd = (sol_out / 1000) * sol_price
-            
+            token_price_usd = None
+            if not skip_price_check:
+                # Get current token price (Jupiter для аналізу)
+                test_amount = 1000 * (10**token_decimals)
+                
+                # Rate limiting: чекати між запитами до Jupiter
+                await _wait_for_jupiter_rate_limit()
+                
+                async with session.get(
+                    f"{JUP}/quote",
+                    params={
+                        "inputMint": token_address,
+                        "outputMint": SOL_MINT,
+                        "amount": test_amount,
+                        "slippageBps": 50
+                    },
+                    timeout=DEFAULT_TIMEOUT,
+                ) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        if not skip_price_check:
+                            return {"success": False, "message": f"Price check HTTP error {resp.status}: {text[:200]}"}
+                        else:
+                            text = await resp.text()
+                            token_price_usd = None
+                    else:
+                        try:
+                            q_test = await resp.json(content_type=None)
+                        except Exception as e:
+                            text = await resp.text()
+                            if not skip_price_check:
+                                return {"success": False, "message": f"Price check JSON parse error: {str(e)}, response: {text[:200]}"}
+                            else:
+                                q_test = None
+                        
+                        if q_test and "error" in q_test:
+                            if not skip_price_check:
+                                return {"success": False, "message": f"Price check error: {q_test.get('error', 'Unknown')}"}
+                        if q_test:
+                            sol_out = int(q_test["outAmount"]) / (10**SOL_DECIMALS)
+                            token_price_usd = (sol_out / 1000) * sol_price
+           
             # Calculate amount to sell
             raw_amount = int(round(token_amount * (10**token_decimals)))
             
@@ -1848,3 +1886,65 @@ async def force_buy(token_id: int, simulate: bool = False) -> dict:
     If simulate=True, transaction is simulated without actually sending to blockchain.
     """
     return await buy_real(token_id, source='force_buy', simulate=simulate)
+
+
+# =============================================================================
+# CLI helper
+# =============================================================================
+async def _cli_force_sell(token_address: str, key_id: int, simulate: bool) -> int:
+    """
+    Sell entire position for token_address from wallet key_id via CLI.
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, wallet_id
+            FROM tokens
+            WHERE token_address = $1 OR token_pair = $1
+            ORDER BY token_updated_at DESC NULLS LAST, id DESC
+            LIMIT 1
+            """,
+            token_address,
+        )
+
+    if not row:
+        print(f"[CLI] ❌ Token '{token_address}' not found in tokens table.")
+        await close_db_pool()
+        return 1
+
+    token_id = int(row["id"])
+    bound_wallet = row["wallet_id"]
+    if not bound_wallet:
+        print(f"[CLI] ❌ Token {token_id} has no wallet binding (wallet_id=NULL). Cannot sell.")
+        await close_db_pool()
+        return 1
+
+    bound_wallet = int(bound_wallet)
+    if bound_wallet != key_id:
+        print(
+            f"[CLI] ❌ Wallet mismatch: token {token_id} bound to wallet_id={bound_wallet}, "
+            f"but --key-id={key_id} supplied."
+        )
+        await close_db_pool()
+        return 1
+
+    print(f"[CLI] 🚀 Selling token_id={token_id}, wallet_id={bound_wallet}, simulate={simulate}")
+    result = await sell_real(token_id, source="cli_force_sell", simulate=simulate)
+    await close_db_pool()
+
+    if result.get("success"):
+        print(f"[CLI] ✅ Sell completed: {result.get('message', 'success')}")
+        amt = result.get("amount_usd") or result.get("actual_amount_usd")
+        if amt is not None:
+            print(f"[CLI] 💵 Amount USD: {amt}")
+        price = result.get("price_usd")
+        if price is not None:
+            print(f"[CLI] 🏷 Price USD: {price}")
+        sig = result.get("signature")
+        if sig:
+            print(f"[CLI] 🔗 Signature: {sig}")
+        return 0
+
+    print(f"[CLI] ❌ Sell failed: {result.get('message', 'Unknown error')}")
+    return 1

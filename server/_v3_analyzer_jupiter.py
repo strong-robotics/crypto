@@ -1235,8 +1235,8 @@ class JupiterAnalyzerV3:
                                 )
                             else:
                                 auto_buy_check = None
-                                if self.debug and iterations < entry_gate_iter:
-                                    print(f"[Analyzer] ⏸ Auto-buy waiting: token {token_id} iterations={iterations} < entry gate {entry_gate_iter}")
+                                # if self.debug and iterations < entry_gate_iter:
+                                    # print(f"[Analyzer] ⏸ Auto-buy waiting: token {token_id} iterations={iterations} < entry gate {entry_gate_iter}")
 
                             if auto_buy_check:
                                     segments = [
@@ -1329,8 +1329,8 @@ class JupiterAnalyzerV3:
                                         gate_reason = "final_gate_failed"
                                         skip_auto_buy = True
                                     
-                                    if skip_auto_buy and self.debug:
-                                        print(f"[Analyzer] ⚠️ Auto-buy blocked for token {token_id}: reason={gate_reason}")
+                                    # if skip_auto_buy and self.debug:
+                                        # print(f"[Analyzer] ⚠️ Auto-buy blocked for token {token_id}: reason={gate_reason}")
                                     
                                     if not skip_auto_buy and iterations >= self.auto_buy_iter:
                                             # Execute real buy in background task (non-blocking)
@@ -1351,7 +1351,8 @@ class JupiterAnalyzerV3:
                                             # Create background task (non-blocking)
                                             asyncio.create_task(_auto_buy_task())
                                     elif not skip_auto_buy and iterations < self.auto_buy_iter and self.debug:
-                                        print(f"[Analyzer] ⏸ Auto-buy waiting buffer for token {token_id}: iter={iterations}, required={self.auto_buy_iter}")
+                                        pass
+                                        # print(f"[Analyzer] ⏸ Auto-buy waiting buffer for token {token_id}: iter={iterations}, required={self.auto_buy_iter}")
                 except Exception:
                     pass
 

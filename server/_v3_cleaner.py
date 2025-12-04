@@ -153,23 +153,95 @@ async def _find_no_swap_tokens(conn, limit: int) -> List[int]:
     return [int(r["id"]) for r in rows]
 
 
-async def _find_no_pair_tokens(conn, older_than_sec: int, limit: int) -> List[int]:
-    """Catch tokens that давно без валидной пары (token_pair NULL/==address)."""
-    if limit <= 0:
+async def _find_no_pair_tokens(conn, min_iterations: int, limit: int) -> List[int]:
+    """Catch tokens без пары и с достаточным числом метрик (итераций)."""
+    if limit <= 0 or min_iterations <= 0:
         return []
     rows = await conn.fetch(
         """
-        SELECT id
-        FROM tokens
-        WHERE (token_pair IS NULL OR token_pair = token_address)
-          AND EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - COALESCE(created_at, CURRENT_TIMESTAMP))) >= $2
-        ORDER BY created_at ASC
+        WITH metric_counts AS (
+            SELECT token_id, COUNT(*) AS cnt
+            FROM token_metrics_seconds
+            GROUP BY token_id
+        )
+        SELECT t.id
+        FROM tokens t
+        JOIN metric_counts mc ON mc.token_id = t.id
+        WHERE (t.token_pair IS NULL OR t.token_pair = t.token_address)
+          AND mc.cnt >= $2
+        ORDER BY mc.cnt DESC, t.id ASC
         LIMIT $1
         """,
         limit,
-        older_than_sec,
+        min_iterations,
     )
     return [int(r["id"]) for r in rows]
+
+
+async def _count_no_pair_tokens(conn) -> int:
+    row = await conn.fetchval(
+        """
+        SELECT COUNT(*)
+        FROM tokens
+        WHERE token_pair IS NULL OR token_pair = token_address
+        """
+    )
+    return int(row or 0)
+
+
+async def _count_no_swap_tokens(conn) -> int:
+    row = await conn.fetchval(
+        """
+        SELECT COUNT(*)
+        FROM tokens
+        WHERE no_swap_after_second_corridor = TRUE
+        """
+    )
+    return int(row or 0)
+
+
+async def _drain_no_swap_tokens(conn, batch_size: int) -> int:
+    """Move all no-swap tokens to bad tables without waiting for main limit."""
+    if batch_size <= 0:
+        return 0
+    total = 0
+    initial_count = await _count_no_swap_tokens(conn)
+    while True:
+        ids = await _find_no_swap_tokens(conn, batch_size)
+        if not ids:
+            break
+        removed = await _move_to_bad_tables(conn, ids, "no_swap")
+        total += removed
+        if len(ids) < batch_size:
+            break
+    if total > 0:
+        remaining = await _count_no_swap_tokens(conn)
+        print(
+            f"[Cleaner] no_swap moved={total} tokens (start={initial_count}, remaining={remaining})"
+        )
+    return total
+
+
+async def _drain_no_pair_tokens(conn, min_iterations: int, batch_size: int) -> int:
+    """Move all no-pair tokens to bad tables without waiting for main limit."""
+    if batch_size <= 0 or min_iterations <= 0:
+        return 0
+    total = 0
+    initial_count = await _count_no_pair_tokens(conn)
+    while True:
+        ids = await _find_no_pair_tokens(conn, min_iterations, batch_size)
+        if not ids:
+            break
+        removed = await _move_to_bad_tables(conn, ids, "no_pair")
+        total += removed
+        if len(ids) < batch_size:
+            break
+    if total > 0:
+        remaining = await _count_no_pair_tokens(conn)
+        print(
+            f"[Cleaner] no_pair moved={total} tokens (start={initial_count}, remaining={remaining})"
+        )
+    return total
 
 
 async def _find_no_price_tokens(conn, limit: int) -> List[int]:
@@ -345,10 +417,22 @@ async def _move_to_bad_tables(conn, ids: List[int], reason: str) -> int:
         return 0
     await conn.execute(
         """
+        DELETE FROM bad_tokens bt
+        USING tokens t
+        WHERE t.id = ANY($1)
+          AND bt.token_address = t.token_address
+        """,
+        ids,
+    )
+    await conn.execute(
+        """
         INSERT INTO bad_tokens
         SELECT t.*, $2 AS removed_reason, CURRENT_TIMESTAMP AS removed_at
         FROM tokens t
         WHERE t.id = ANY($1)
+        ON CONFLICT (id) DO UPDATE
+        SET removed_reason = EXCLUDED.removed_reason,
+            removed_at = CURRENT_TIMESTAMP
         """,
         ids,
         reason,
@@ -391,23 +475,25 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
             archived_summary: Dict[str, int] = {}
             archive_threshold = int(getattr(config, "ARCHIVE_MIN_ITERATIONS", 0) or 0)
 
-            flagged_ids = await _find_no_swap_tokens(conn, remaining)
-            if flagged_ids:
-                if dry_run:
+            if dry_run:
+                flagged_ids = await _find_no_swap_tokens(conn, remaining)
+                if flagged_ids:
                     ids.extend(flagged_ids)
-                else:
-                    await _purge_batch(conn, flagged_ids)
-                    bad_removed["no_swap"] = bad_removed.get("no_swap", 0) + len(flagged_ids)
-                remaining = max(0, remaining - len(flagged_ids))
+                    remaining = max(0, remaining - len(flagged_ids))
+            else:
+                removed = await _drain_no_swap_tokens(conn, limit)
+                if removed:
+                    bad_removed["no_swap"] = bad_removed.get("no_swap", 0) + removed
 
-            no_pair_ids = await _find_no_pair_tokens(conn, older_than_sec, remaining)
-            if no_pair_ids:
-                if dry_run:
+            if dry_run:
+                no_pair_ids = await _find_no_pair_tokens(conn, older_than_sec, remaining)
+                if no_pair_ids:
                     ids.extend(no_pair_ids)
-                else:
-                    await _purge_batch(conn, no_pair_ids)
-                    bad_removed["no_pair"] = bad_removed.get("no_pair", 0) + len(no_pair_ids)
-                remaining = max(0, remaining - len(no_pair_ids))
+                    remaining = max(0, remaining - len(no_pair_ids))
+            else:
+                removed = await _drain_no_pair_tokens(conn, older_than_sec, limit)
+                if removed:
+                    bad_removed["no_pair"] = bad_removed.get("no_pair", 0) + removed
 
             zero_tail_candidates = await _find_flagged_tokens(conn, "zero_tail", remaining)
             if zero_tail_candidates:
@@ -438,7 +524,14 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
             remaining = max(0, limit - len(ids))
 
             orphan_ids = await _find_candidates(conn, older_than_sec, remaining)
-            ids.extend(orphan_ids)
+            if orphan_ids:
+                if dry_run:
+                    ids.extend(orphan_ids)
+                else:
+                    removed = await _move_to_bad_tables(conn, orphan_ids, "orphan")
+                    if removed:
+                        bad_removed["orphan"] = bad_removed.get("orphan", 0) + removed
+            remaining = max(0, limit - len(ids))
 
             ids = list(dict.fromkeys(ids))
             extra_processed = 0 if dry_run else (len(zero_tail_candidates) + len(frozen_candidates))
@@ -459,10 +552,6 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
             if no_price_ids:
                 count = await _flag_tokens(conn, no_price_ids, "no_price")
                 summary["no_price"] = count
-                flagged_total += count
-            if orphan_ids:
-                count = await _flag_tokens(conn, orphan_ids, "orphan")
-                summary["orphan"] = count
                 flagged_total += count
             if holder_archive_ids:
                 count = await _flag_tokens(conn, holder_archive_ids, "low_holders")
