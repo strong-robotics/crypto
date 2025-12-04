@@ -227,7 +227,7 @@ async def _drain_no_pair_tokens(conn, min_iterations: int, batch_size: int) -> i
     if batch_size <= 0 or min_iterations <= 0:
         return 0
     total = 0
-    initial_count = await _count_no_pair_tokens(conn)
+    # initial_count = await _count_no_pair_tokens(conn)
     while True:
         ids = await _find_no_pair_tokens(conn, min_iterations, batch_size)
         if not ids:
@@ -236,11 +236,11 @@ async def _drain_no_pair_tokens(conn, min_iterations: int, batch_size: int) -> i
         total += removed
         if len(ids) < batch_size:
             break
-    if total > 0:
-        remaining = await _count_no_pair_tokens(conn)
-        print(
-            f"[Cleaner] no_pair moved={total} tokens (start={initial_count}, remaining={remaining})"
-        )
+    # if total > 0:
+        # remaining = await _count_no_pair_tokens(conn)
+        # print(
+        #     f"[Cleaner] no_pair moved={total} tokens (start={initial_count}, remaining={remaining})"
+        # )
     return total
 
 

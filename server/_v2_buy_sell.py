@@ -9,6 +9,7 @@ import json
 import os
 import random
 import sys
+from math import floor
 from pathlib import Path
 from typing import Dict, Optional, Any
 
@@ -74,6 +75,11 @@ BASE_TX_FEE_LAMPORTS = 5000
 # Rate limiting для Jupiter API: максимум 1 запит в секунду
 _jupiter_rate_limiter = asyncio.Semaphore(1)
 _last_jupiter_request_time = 0.0
+LAMPORTS_PER_SOL = 1_000_000_000
+HELIUS_INITIAL_DELAY_SEC = float(getattr(config, "HELIUS_INITIAL_DELAY_SEC", 2.0) or 0.0)
+HELIUS_RETRY_DELAY_SEC = float(getattr(config, "HELIUS_RETRY_DELAY_SEC", 2.0) or 0.0)
+HELIUS_RETRY_BACKOFF = float(getattr(config, "HELIUS_RETRY_BACKOFF", 1.5) or 1.0)
+HELIUS_MAX_ATTEMPTS = int(getattr(config, "HELIUS_MAX_ATTEMPTS", 5) or 1)
 
 
 async def _archive_or_purge_token(conn, token_id: int, iteration_count: Optional[int] = None) -> Dict[str, Any]:
@@ -944,55 +950,11 @@ async def execute_sell(
     Returns:
         dict with success, signature, amount_sol, amount_usd, price_usd, etc.
     """
-    skip_price_check = bool(getattr(config, "SELL_SKIP_PRICE_CHECK", False))
-
     try:
         async with aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT) as session:
             sol_price = get_current_sol_price()
             if sol_price <= 0:
                 return {"success": False, "message": "Failed to get SOL price"}
-            
-            token_price_usd = None
-            if not skip_price_check:
-                # Get current token price (Jupiter для аналізу)
-                test_amount = 1000 * (10**token_decimals)
-                
-                # Rate limiting: чекати між запитами до Jupiter
-                await _wait_for_jupiter_rate_limit()
-                
-                async with session.get(
-                    f"{JUP}/quote",
-                    params={
-                        "inputMint": token_address,
-                        "outputMint": SOL_MINT,
-                        "amount": test_amount,
-                        "slippageBps": 50
-                    },
-                    timeout=DEFAULT_TIMEOUT,
-                ) as resp:
-                    if resp.status != 200:
-                        text = await resp.text()
-                        if not skip_price_check:
-                            return {"success": False, "message": f"Price check HTTP error {resp.status}: {text[:200]}"}
-                        else:
-                            text = await resp.text()
-                            token_price_usd = None
-                    else:
-                        try:
-                            q_test = await resp.json(content_type=None)
-                        except Exception as e:
-                            text = await resp.text()
-                            if not skip_price_check:
-                                return {"success": False, "message": f"Price check JSON parse error: {str(e)}, response: {text[:200]}"}
-                            else:
-                                q_test = None
-                        
-                        if q_test and "error" in q_test:
-                            if not skip_price_check:
-                                return {"success": False, "message": f"Price check error: {q_test.get('error', 'Unknown')}"}
-                        if q_test:
-                            sol_out = int(q_test["outAmount"]) / (10**SOL_DECIMALS)
-                            token_price_usd = (sol_out / 1000) * sol_price
            
             # Calculate amount to sell
             raw_amount = int(round(token_amount * (10**token_decimals)))
@@ -1280,7 +1242,14 @@ async def sell_real(token_id: int, *, source: str = 'auto_sell', simulate: bool 
         print(f"[sell_real] ✅ Keypair loaded: {keypair.pubkey()}")
         
         # 4.5. Use DB token amount directly (avoid extra RPC requests that hit rate limits)
-        token_amount = token_amount_db
+        # Ensure we sell only whole tokens to avoid fractional residuals causing failures
+        token_amount = floor(token_amount_db)
+        if token_amount <= 0:
+            print(f"[sell_real] ❌ Token amount too small after flooring: {token_amount_db}")
+            await _log("failed", "Token amount too small after flooring", wallet_id)
+            return {"success": False, "message": "Token amount too small after flooring"}
+        if token_amount < token_amount_db:
+            print(f"[sell_real] ℹ️ Truncated fractional tokens ({token_amount_db - token_amount:.8f}). Selling {token_amount} whole tokens.")
         print(f"[sell_real] 🧾 Using DB token amount: {token_amount:.8f} tokens for sell execution")
 
         # 5. Execute real sell with retry logic (reduce amount by 1% on failure)
@@ -1314,7 +1283,10 @@ async def sell_real(token_id: int, *, source: str = 'auto_sell', simulate: bool 
             
             # Failed - reduce amount by 1% for next attempt
             if attempt < max_retries - 1:
-                current_amount = current_amount * 0.99  # Reduce by 1%
+                next_amount = floor(current_amount * 0.99)
+                if next_amount == current_amount and current_amount > 1:
+                    next_amount -= 1
+                current_amount = max(next_amount, 1)
                 # Wait before next retry to avoid Jupiter rate limiting
                 await asyncio.sleep(random.uniform(*RETRY_DELAY))
                 # Continue to next retry
@@ -1824,8 +1796,9 @@ async def buy_real(token_id: int, *, source: str = 'auto_buy', simulate: bool = 
         entry_iteration = await get_token_iterations_count(conn, token_id)
         
         # Log to history
+        history_id = None
         try:
-            await conn.execute(
+            history_id = await conn.fetchval(
                 """
                 INSERT INTO wallet_history(
                     wallet_id, token_id,
@@ -1834,6 +1807,7 @@ async def buy_real(token_id: int, *, source: str = 'auto_buy', simulate: bool = 
                     entry_expected_amount_usd, entry_actual_amount_usd, entry_signature,
                     outcome, reason, created_at, updated_at
                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'','manual',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                RETURNING id
                 """,
                 key_id, token_id,
                 entry_amount_usd, buy_result.get("amount_tokens"), buy_result.get("price_usd"), entry_iteration,
@@ -1854,6 +1828,19 @@ async def buy_real(token_id: int, *, source: str = 'auto_buy', simulate: bool = 
             print(f"[buy_real] ⚠️ Failed to write to wallet_history: {e}")
             import traceback
             traceback.print_exc()
+
+        # After transaction is confirmed, reconcile quantities/fees with on-chain data (Helius)
+        if history_id and not simulate:
+            await _update_real_buy_metrics(
+                conn=conn,
+                history_id=history_id,
+                token_id=token_id,
+                wallet_id=key_id,
+                wallet_address=str(keypair.pubkey()),
+                signature=signature,
+                token_address=token_address,
+                token_decimals=token_decimals
+            )
         
         return {
             "success": True,
@@ -1886,6 +1873,143 @@ async def force_buy(token_id: int, simulate: bool = False) -> dict:
     If simulate=True, transaction is simulated without actually sending to blockchain.
     """
     return await buy_real(token_id, source='force_buy', simulate=simulate)
+
+
+async def _fetch_helius_transaction(
+    signature: str,
+    retries: int = HELIUS_MAX_ATTEMPTS,
+    initial_delay: float = HELIUS_INITIAL_DELAY_SEC,
+    delay: float = HELIUS_RETRY_DELAY_SEC,
+    backoff: float = HELIUS_RETRY_BACKOFF,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch parsed transaction payload from Helius Transaction API.
+    """
+    api_key = getattr(config, "HELIUS_API_KEY", "").strip()
+    if not api_key:
+        print("[buy_real] ⚠️ HELIUS_API_KEY not configured; skipping reconciliation")
+        return None
+
+    base_url = getattr(config, "HELIUS_TRANSACTIONS_URL", "https://api.helius.xyz/v0/transactions")
+    url = f"{base_url}?api-key={api_key}"
+    payload = {"transactions": [signature]}
+
+    wait = max(initial_delay, 0.0)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    delay_between = max(delay, 0.0)
+    backoff = max(backoff, 1.0)
+    for attempt in range(1, retries + 1):
+        try:
+            async with aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT) as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise RuntimeError(f"Helius HTTP {resp.status}: {text[:200]}")
+                    data = await resp.json()
+                    if isinstance(data, list) and data:
+                        return data[0]
+                    raise RuntimeError("Helius returned empty response")
+        except Exception as e:
+            print(f"[buy_real] ⚠️ Helius fetch failed (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                if delay_between > 0:
+                    await asyncio.sleep(delay_between)
+                delay_between *= backoff
+            else:
+                return None
+    return None
+
+
+def _extract_token_amount_from_tx(tx_data: Dict[str, Any], wallet_address: str, token_address: str, token_decimals: int) -> Optional[float]:
+    """
+    Extract token amount transferred to wallet from Helius payload.
+    """
+    if not tx_data:
+        return None
+
+    for transfer in tx_data.get("tokenTransfers", []):
+        if transfer.get("mint") == token_address and transfer.get("toUserAccount") == wallet_address:
+            amount = transfer.get("tokenAmount")
+            if amount is not None:
+                try:
+                    return float(amount)
+                except ValueError:
+                    pass
+            raw = transfer.get("rawTokenAmount") or {}
+            raw_amount = raw.get("tokenAmount")
+            decimals = raw.get("decimals", token_decimals)
+            if raw_amount is not None:
+                try:
+                    return float(raw_amount) / (10 ** decimals)
+                except Exception:
+                    continue
+
+    for acc in tx_data.get("accountData", []):
+        for change in acc.get("tokenBalanceChanges", []):
+            if change.get("userAccount") == wallet_address and change.get("mint") == token_address:
+                raw = change.get("rawTokenAmount") or {}
+                raw_amount = raw.get("tokenAmount")
+                decimals = raw.get("decimals", token_decimals)
+                if raw_amount is not None:
+                    try:
+                        return float(raw_amount) / (10 ** decimals)
+                    except Exception:
+                        continue
+    return None
+
+
+async def _update_real_buy_metrics(
+    conn,
+    history_id: int,
+    token_id: int,
+    wallet_id: int,
+    wallet_address: str,
+    signature: str,
+    token_address: str,
+    token_decimals: int,
+) -> None:
+    """
+    After a buy succeeds, fetch actual on-chain data (via Helius) and update wallet_history.
+    """
+    confirmed = await _wait_for_signature_confirmation(signature)
+    if not confirmed:
+        print(f"[buy_real] ⚠️ Signature {signature} not confirmed within timeout; skipping reconciliation")
+        return
+    tx_data = await _fetch_helius_transaction(signature)
+    if not tx_data:
+        print(f"[buy_real] ⚠️ Helius did not return data for signature {signature}; keeping quoted metrics.")
+        return
+
+    actual_token_amount = _extract_token_amount_from_tx(tx_data, wallet_address, token_address, token_decimals)
+    fee_lamports = int(tx_data.get("fee") or 0)
+    priority_lamports = int(tx_data.get("priorityFee") or tx_data.get("priority_fee") or tx_data.get("prioritizationFeeLamports") or 0)
+    total_fee_lamports = fee_lamports + priority_lamports
+    fee_sol = total_fee_lamports / LAMPORTS_PER_SOL if total_fee_lamports else None
+    fee_usd = fee_sol * get_current_sol_price() if fee_sol else None
+
+    try:
+        await conn.execute(
+            """
+            UPDATE wallet_history
+            SET
+                entry_token_amount = COALESCE($2, entry_token_amount),
+                entry_transaction_fee_sol = COALESCE($3, entry_transaction_fee_sol),
+                entry_transaction_fee_usd = COALESCE($4, entry_transaction_fee_usd),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            """,
+            history_id,
+            actual_token_amount,
+            fee_sol,
+            fee_usd,
+        )
+        if actual_token_amount is not None:
+            print(f"[buy_real] ♻️ wallet_history#{history_id}: token amount reconciled to {actual_token_amount:.8f}")
+        if fee_sol is not None:
+            print(f"[buy_real] ♻️ wallet_history#{history_id}: fee updated to {fee_sol:.9f} SOL")
+    except Exception as e:
+        print(f"[buy_real] ⚠️ Failed to update wallet_history with real metrics: {e}")
 
 
 # =============================================================================

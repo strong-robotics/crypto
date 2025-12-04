@@ -64,16 +64,22 @@ class TokensReaderV3:
                     where_history = ""
 
                 if use_history:
-                    order_clause = "ORDER BY COALESCE(t.archived_at, t.token_updated_at, t.created_at) DESC"
+                    default_order_clause = (
+                        "ORDER BY COALESCE(t.holder_count, 0) DESC, "
+                        "COALESCE(t.archived_at, t.token_updated_at, t.created_at) DESC"
+                    )
                     archived_at_select = "t.archived_at"
                 else:
-                    order_clause = "ORDER BY COALESCE(t.holder_count, 0) DESC, t.created_at DESC"
+                    default_order_clause = "ORDER BY COALESCE(t.holder_count, 0) DESC, t.created_at DESC"
                     archived_at_select = "NULL::timestamp AS archived_at"
+
                 if self.disable_sort:
                     if use_history:
                         order_clause = "ORDER BY COALESCE(t.archived_at, t.token_updated_at, t.created_at) ASC"
                     else:
                         order_clause = "ORDER BY t.created_at ASC"
+                else:
+                    order_clause = default_order_clause
 
                 sql = f"""
                     WITH 
@@ -601,22 +607,11 @@ class TokensReaderV3:
                     })
                 
                 def sort_key(token: Dict[str, Any]):
-                    entry_iter = token.get("entry_iteration")
-                    exit_iter = token.get("exit_iteration")
-                    pattern_code_token = (token.get("pattern_code") or "").strip().lower()
-                    has_buy = entry_iter is not None
-                    has_sell = exit_iter is not None
-                    if has_buy and not has_sell:
-                        priority = 0  # активные сделки (вошли и ещё держим)
-                    elif not has_buy and pattern_code_token in ("", "unknown"):
-                        priority = 1  # пока без входа и без паттерна — проверяем первыми
-                    elif has_buy and has_sell:
-                        priority = 2  # уже вышли
-                    elif not has_buy:
-                        priority = 3  # нет входа, но паттерн уже определён
-                    else:
-                        priority = 4
-                    pattern_score = token.get("pattern_score", 0) or 0
+                    """
+                    Wallet-bound tokens must go first, both groups sorted by live holder count descending.
+                    """
+                    wallet_bound_priority = 0 if token.get("wallet_id") is not None else 1
+                    holders_count = float(token.get("holders") or 0)
                     created = token.get("created_at")
                     created_ord = 0.0
                     if created:
@@ -625,8 +620,8 @@ class TokensReaderV3:
                         except Exception:
                             created_ord = 0.0
                     return (
-                        priority,
-                        -pattern_score,
+                        wallet_bound_priority,
+                        -holders_count,
                         -created_ord
                     )
 

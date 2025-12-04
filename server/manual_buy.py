@@ -7,7 +7,7 @@ Usage example:
       --key-id 2 \
       --token-address 8Tg6NK4nVe3uCz9FqhGqoY7Ed22th2YLULvCnRNnPBjR \
       --amount-usd 1.0 \
-      --decimals 6
+      --decimals 9
 """
 
 import argparse
@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import aiohttp
 from solders.keypair import Keypair
@@ -45,9 +46,14 @@ async def fetch_sol_price() -> float:
 JUP_BASE = "https://lite-api.jup.ag/swap/v1"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 SOL_DECIMALS = 9
+LAMPORTS_PER_SOL = 1_000_000_000
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=15)
 RPC_TIMEOUT = aiohttp.ClientTimeout(total=30)
 BUY_SLIPPAGE_LEVELS = list(getattr(config, "BUY_SLIPPAGE_LEVELS", [250, 350, 450, 550]))
+HELIUS_INITIAL_DELAY_SEC = float(getattr(config, "HELIUS_INITIAL_DELAY_SEC", 2.0) or 0.0)
+HELIUS_RETRY_DELAY_SEC = float(getattr(config, "HELIUS_RETRY_DELAY_SEC", 2.0) or 0.0)
+HELIUS_RETRY_BACKOFF = float(getattr(config, "HELIUS_RETRY_BACKOFF", 1.5) or 1.0)
+HELIUS_MAX_ATTEMPTS = int(getattr(config, "HELIUS_MAX_ATTEMPTS", 5) or 1)
 
 _rate_lock = asyncio.Lock()
 _last_request = 0.0
@@ -90,6 +96,40 @@ def _rpc_endpoint() -> str:
     if helius_key:
         return f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
     return getattr(config, "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+
+
+async def _fetch_token_decimals(token_address: str) -> Optional[int]:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getAccountInfo",
+        "params": [token_address, {"encoding": "base64"}],
+    }
+    async with aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT) as session:
+        async with session.post(_rpc_endpoint(), json=payload) as resp:
+            data = await resp.json(content_type=None)
+            value = data.get("result", {}).get("value")
+            if not value:
+                return None
+            b64_data = value.get("data", [None])[0]
+            if not b64_data:
+                return None
+            raw = base64.b64decode(b64_data)
+            if len(raw) > 44:
+                return raw[44]
+    return None
+
+
+async def _resolve_token_decimals(token_address: str, override: Optional[int]) -> int:
+    actual = await _fetch_token_decimals(token_address)
+    if actual is not None:
+        if override is not None and override != actual:
+            print(f"[ManualBuy] ℹ️ Provided decimals {override}, but mint uses {actual}. Using on-chain value.")
+        return actual
+    if override is not None:
+        return override
+    print("[ManualBuy] ⚠️ Failed to fetch token decimals; defaulting to 6")
+    return 6
 
 
 async def _fetch_quote(session: aiohttp.ClientSession, token_address: str, amount_raw: int, slippage_bps: int):
@@ -152,9 +192,112 @@ async def _send_transaction(session: aiohttp.ClientSession, swap_payload: dict, 
         return sig
 
 
+async def _wait_for_signature_confirmation(signature: str, timeout_sec: float = 30.0, poll_interval: float = 0.5) -> bool:
+    rpc = _rpc_endpoint()
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSignatureStatuses",
+        "params": [[signature], {"searchTransactionHistory": True}],
+    }
+    deadline = asyncio.get_event_loop().time() + timeout_sec
+    async with aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT) as session:
+        while True:
+            try:
+                async with session.post(rpc, json=payload) as resp:
+                    data = await resp.json(content_type=None)
+                    value = data.get("result", {}).get("value", [None])[0]
+                    if value is not None:
+                        return True
+            except Exception as exc:
+                print(f"[ManualBuy] ⚠️ getSignatureStatuses error: {exc}")
+            if asyncio.get_event_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(poll_interval)
+
+
+async def _fetch_helius_transaction(
+    signature: str,
+    retries: int = HELIUS_MAX_ATTEMPTS,
+    initial_delay: float = HELIUS_INITIAL_DELAY_SEC,
+    delay: float = HELIUS_RETRY_DELAY_SEC,
+    backoff: float = HELIUS_RETRY_BACKOFF,
+):
+    api_key = getattr(config, "HELIUS_API_KEY", "").strip()
+    if not api_key:
+        print("[ManualBuy] ⚠️ HELIUS_API_KEY not set; cannot fetch real swap data")
+        return None
+    base_url = getattr(config, "HELIUS_TRANSACTIONS_URL", "https://api.helius.xyz/v0/transactions")
+    url = f"{base_url}?api-key={api_key}"
+    payload = {"transactions": [signature]}
+
+    wait = max(initial_delay, 0.0)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    delay_between = max(delay, 0.0)
+    backoff = max(backoff, 1.0)
+    for attempt in range(1, retries + 1):
+        try:
+            async with aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT) as helius_session:
+                async with helius_session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise RuntimeError(f"Helius HTTP {resp.status}: {text[:200]}")
+                    data = await resp.json()
+                    if isinstance(data, list) and data:
+                        return data[0]
+                    raise RuntimeError("Helius returned empty response")
+        except Exception as exc:
+            print(f"[ManualBuy] ⚠️ Helius fetch failed (attempt {attempt}/{retries}): {exc}")
+            if attempt < retries:
+                if delay_between > 0:
+                    await asyncio.sleep(delay_between)
+                delay_between *= backoff
+            else:
+                return None
+    return None
+
+
+def _extract_token_amount_from_tx(tx_data: dict, wallet_address: str, token_address: str, decimals: int) -> Optional[float]:
+    if not tx_data:
+        return None
+
+    for transfer in tx_data.get("tokenTransfers", []):
+        if transfer.get("mint") == token_address and transfer.get("toUserAccount") == wallet_address:
+            amount = transfer.get("tokenAmount")
+            if amount is not None:
+                try:
+                    return float(amount)
+                except ValueError:
+                    pass
+            raw = transfer.get("rawTokenAmount") or {}
+            raw_amount = raw.get("tokenAmount")
+            raw_decimals = raw.get("decimals", decimals)
+            if raw_amount is not None:
+                try:
+                    return float(raw_amount) / (10 ** raw_decimals)
+                except Exception:
+                    continue
+
+    for account in tx_data.get("accountData", []):
+        for change in account.get("tokenBalanceChanges", []):
+            if change.get("userAccount") == wallet_address and change.get("mint") == token_address:
+                raw = change.get("rawTokenAmount") or {}
+                raw_amount = raw.get("tokenAmount")
+                raw_decimals = raw.get("decimals", decimals)
+                if raw_amount is not None:
+                    try:
+                        return float(raw_amount) / (10 ** raw_decimals)
+                    except Exception:
+                        continue
+    return None
+
+
 async def manual_buy(args):
     keypair = _load_keypair(args.key_id)
     print(f"[ManualBuy] Wallet loaded: {keypair.pubkey()}")
+
+    decimals = await _resolve_token_decimals(args.token_address, args.decimals)
 
     sol_price = await fetch_sol_price()
     if sol_price <= 0:
@@ -175,13 +318,34 @@ async def manual_buy(args):
                 swap_payload = await _fetch_swap(session, quote, str(keypair.pubkey()))
                 sig = await _send_transaction(session, swap_payload, keypair)
 
-                out_amount_tokens = int(quote["outAmount"]) / (10 ** args.decimals)
+                confirmed = await _wait_for_signature_confirmation(sig)
+                if not confirmed:
+                    print("[ManualBuy] ⚠️ Transaction confirmation timed out; skipping Helius reconciliation")
+
+                out_amount_tokens = int(quote["outAmount"]) / (10 ** decimals)
                 real_price = args.amount_usd / out_amount_tokens if out_amount_tokens > 0 else 0.0
                 print("[ManualBuy] ✅ Buy completed")
                 print(f"  - Slippage used: {slippage_bps / 100:.2f}%")
                 print(f"  - Tokens received: {out_amount_tokens:.8f}")
                 print(f"  - Effective price: ${real_price:.8f} per token")
                 print(f"  - Signature: {sig}")
+
+                if confirmed:
+                    tx_data = await _fetch_helius_transaction(sig)
+                    if tx_data:
+                        actual_tokens = _extract_token_amount_from_tx(tx_data, str(keypair.pubkey()), args.token_address, decimals)
+                        if actual_tokens is not None:
+                            print(f"  - Actual tokens on-chain: {actual_tokens:.8f}")
+                        fee_lamports = int(tx_data.get("fee") or 0)
+                        priority_lamports = int(tx_data.get("priorityFee") or tx_data.get("priority_fee") or tx_data.get("prioritizationFeeLamports") or 0)
+                        total_fee = fee_lamports + priority_lamports
+                        if total_fee:
+                            fee_sol = total_fee / LAMPORTS_PER_SOL
+                            fee_usd = fee_sol * sol_price
+                            print(f"  - Real fee paid: {fee_sol:.9f} SOL (${fee_usd:.6f})")
+                    else:
+                        print("[ManualBuy] ⚠️ Helius did not return transaction data after retries; keeping quote numbers.")
+
                 return
             except Exception as exc:
                 print(f"[ManualBuy] ⚠️ Attempt with slippage {slippage_bps}bps failed: {exc}")
@@ -194,7 +358,7 @@ def parse_args():
     parser.add_argument("--token-address", required=True, help="Token mint to buy")
     parser.add_argument("--key-id", type=int, required=True, help="Wallet ID from keys.json")
     parser.add_argument("--amount-usd", type=float, required=True, help="Spend amount in USD")
-    parser.add_argument("--decimals", type=int, default=6, help="Token decimals (default 6)")
+    parser.add_argument("--decimals", type=int, default=None, help="Token decimals (auto-detect if omitted)")
     return parser.parse_args()
 
 

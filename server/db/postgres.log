@@ -80,3 +80,5 @@
 2025-11-26 17:03:23.048 GMT [76123] HINT:  Future log output will appear in directory "logs".
 2025-11-28 12:39:04.348 GMT [25751] LOG:  redirecting log output to logging collector process
 2025-11-28 12:39:04.348 GMT [25751] HINT:  Future log output will appear in directory "logs".
+2025-12-04 11:01:05.211 GMT [48565] LOG:  redirecting log output to logging collector process
+2025-12-04 11:01:05.211 GMT [48565] HINT:  Future log output will appear in directory "logs".
