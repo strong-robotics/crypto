@@ -55,6 +55,22 @@ async def _release_lock(conn) -> None:
         pass
 
 
+async def _filter_tokens_without_wallet(conn, ids: List[int]) -> List[int]:
+    """Return only tokens that are not currently bound to any wallet."""
+    if not ids:
+        return []
+    rows = await conn.fetch(
+        """
+        SELECT id
+        FROM tokens
+        WHERE id = ANY($1)
+          AND (wallet_id IS NULL OR wallet_id = 0)
+        """,
+        ids,
+    )
+    return [int(r["id"]) for r in rows]
+
+
 async def _find_candidates(conn, older_than_sec: int, limit: int) -> List[int]:
     """Find orphan tokens without a valid pair using per-second metric timestamps.
 
@@ -347,6 +363,9 @@ async def _get_iteration_counts(conn, ids: List[int]) -> Dict[int, int]:
 async def _process_flagged_tokens(conn, ids: List[int], reason: str, archive_threshold: int) -> Tuple[int, int]:
     if not ids:
         return (0, 0)
+    ids = await _filter_tokens_without_wallet(conn, ids)
+    if not ids:
+        return (0, 0)
     counts = await _get_iteration_counts(conn, ids)
     archive_ids: List[int] = []
     bad_ids: List[int] = []
@@ -496,6 +515,7 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
                     bad_removed["no_pair"] = bad_removed.get("no_pair", 0) + removed
 
             zero_tail_candidates = await _find_flagged_tokens(conn, "zero_tail", remaining)
+            zero_tail_candidates = await _filter_tokens_without_wallet(conn, zero_tail_candidates)
             if zero_tail_candidates:
                 if dry_run:
                     ids.extend(zero_tail_candidates)
@@ -508,6 +528,7 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
                 remaining = max(0, remaining - len(zero_tail_candidates))
 
             frozen_candidates = await _find_flagged_tokens(conn, "frozen_price", remaining)
+            frozen_candidates = await _filter_tokens_without_wallet(conn, frozen_candidates)
             if frozen_candidates:
                 if dry_run:
                     ids.extend(frozen_candidates)
