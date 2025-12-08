@@ -11,7 +11,7 @@ import random
 import sys
 from math import floor
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Tuple
 
 import aiohttp
 from solders.keypair import Keypair
@@ -418,8 +418,13 @@ def _load_keypair_by_id(key_id: int) -> Optional[Keypair]:
         return None
 
 
-async def get_token_balance(keypair: Keypair, token_address: str, token_decimals: int, session: Optional[aiohttp.ClientSession] = None) -> float:
-    """Отримати реальний баланс токенів на кошельку"""
+async def get_token_balance(
+    keypair: Keypair,
+    token_address: str,
+    token_decimals: int,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> Tuple[float, int]:
+    """Отримати реальний баланс токенів на кошельку (uiAmount, raw units)."""
     owns_session = False
     if session is None:
         session = aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT)
@@ -440,22 +445,61 @@ async def get_token_balance(keypair: Keypair, token_address: str, token_decimals
             data = await resp.json(content_type=None)
             if "result" in data and "value" in data["result"]:
                 accounts = data["result"]["value"]
-                total_amount = 0.0
+                total_raw = 0
+                decimals_used = token_decimals
                 for acc in accounts:
                     parsed = acc.get("account", {}).get("data", {}).get("parsed", {})
                     info = parsed.get("info", {})
                     token_amount = info.get("tokenAmount", {})
+                    decimals_rpc = token_amount.get("decimals")
+                    if decimals_rpc is not None:
+                        decimals_used = decimals_rpc
+                    raw_amount = token_amount.get("amount")
+                    if raw_amount is not None:
+                        try:
+                            total_raw += int(raw_amount)
+                            continue
+                        except Exception:
+                            pass
                     ui_amount = token_amount.get("uiAmount")
                     if ui_amount is not None:
-                        total_amount += float(ui_amount)
-                return total_amount
-        return 0.0
+                        total_raw += int(round(float(ui_amount) * (10 ** token_decimals)))
+                if total_raw <= 0:
+                    return 0.0, 0
+                total_amount = total_raw / (10 ** decimals_used)
+                return float(total_amount), total_raw
+        return 0.0, 0
     except Exception as e:
         print(f"[get_token_balance] ⚠️ Error getting token balance: {e}")
-        return 0.0
+        return 0.0, 0
     finally:
         if owns_session:
             await session.close()
+
+
+async def _wait_for_signature_confirmation(signature: str, timeout_sec: float = 30.0, poll_interval: float = 0.5) -> bool:
+    """Poll RPC for signature confirmation."""
+    rpc_endpoint = _get_balance_rpc()
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSignatureStatuses",
+        "params": [[signature], {"searchTransactionHistory": True}],
+    }
+    deadline = asyncio.get_event_loop().time() + timeout_sec
+    while True:
+        try:
+            async with aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT) as session:
+                async with session.post(rpc_endpoint, json=payload) as resp:
+                    data = await resp.json(content_type=None)
+                    value = data.get("result", {}).get("value", [None])[0]
+                    if value is not None:
+                        return True
+        except Exception:
+            pass
+        if asyncio.get_event_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(poll_interval)
 
 
 async def get_free_wallet(conn, exclude_key_id: Optional[int] = None) -> Optional[Dict]:
@@ -1097,7 +1141,7 @@ async def execute_sell(
                 "signature": signature,
                 "amount_sol": expected_sol,
                 "amount_usd": expected_usd,
-                "price_usd": token_price_usd
+                "price_usd": token_price_usd if 'token_price_usd' in locals() else (expected_usd / token_amount if token_amount > 0 else 0)
             }
             if simulate and final_tx_result:
                 result.update({
@@ -1241,27 +1285,40 @@ async def sell_real(token_id: int, *, source: str = 'auto_sell', simulate: bool 
         
         print(f"[sell_real] ✅ Keypair loaded: {keypair.pubkey()}")
         
-        # 4.5. Use DB token amount directly (avoid extra RPC requests that hit rate limits)
-        # Ensure we sell only whole tokens to avoid fractional residuals causing failures
-        token_amount = floor(token_amount_db)
+        token_amount = token_amount_db
+        balance_ui, balance_raw = await get_token_balance(keypair, token_address, token_decimals)
+        if balance_raw > 0:
+            token_amount = balance_ui
+            diff = token_amount - token_amount_db
+            if abs(diff) > 1e-6:
+                print(f"[sell_real] 🔎 Using on-chain balance ({token_amount:.8f}) differs from journal by {diff:+.8f}")
+            else:
+                print(f"[sell_real] 🔎 Using on-chain balance for sale: {token_amount:.8f} tokens")
+        else:
+            print(f"[sell_real] 🧾 Using token amount from journal: {token_amount:.8f} tokens")
+        
         if token_amount <= 0:
-            print(f"[sell_real] ❌ Token amount too small after flooring: {token_amount_db}")
-            await _log("failed", "Token amount too small after flooring", wallet_id)
-            return {"success": False, "message": "Token amount too small after flooring"}
-        if token_amount < token_amount_db:
-            print(f"[sell_real] ℹ️ Truncated fractional tokens ({token_amount_db - token_amount:.8f}). Selling {token_amount} whole tokens.")
-        print(f"[sell_real] 🧾 Using DB token amount: {token_amount:.8f} tokens for sell execution")
+            print(f"[sell_real] ❌ Token amount too small: {token_amount_db}")
+            await _log("failed", "Token amount too small", wallet_id)
+            return {"success": False, "message": "Token amount too small"}
 
         # 5. Execute real sell with retry logic (reduce amount by 1% on failure)
-        current_amount = token_amount
+        token_amount_raw = balance_raw if balance_raw > 0 else int(round(token_amount * (10 ** token_decimals)))
+        if token_amount_raw <= 0:
+            print(f"[sell_real] ❌ Token amount too small after conversion: {token_amount}")
+            await _log("failed", "Token amount too small", wallet_id)
+            return {"success": False, "message": "Token amount too small"}
+        current_raw = token_amount_raw
+        current_amount = current_raw / (10 ** token_decimals)
         max_retries = 10  # Maximum 10 retries (reduce by 1% each time)
         RETRY_DELAY = (1, 3)  # Delay between retries (1-3 seconds) to avoid Jupiter rate limiting
         sell_result = None
         
-        print(f"[sell_real] 🚀 Starting sell execution: amount={current_amount}, max_retries={max_retries}")
+        print(f"[sell_real] 🚀 Starting sell execution: amount={current_amount:.8f}, max_retries={max_retries}")
         
         for attempt in range(max_retries):
-            print(f"[sell_real] 🔄 Attempt {attempt + 1}/{max_retries}: selling {current_amount} tokens")
+            current_amount = current_raw / (10 ** token_decimals)
+            print(f"[sell_real] 🔄 Attempt {attempt + 1}/{max_retries}: selling {current_amount:.8f} tokens")
             # Execute real sell через Helius (Jupiter для quote/swap, Helius для відправки)
             rpc_endpoint, sender_endpoint = _choose_rpc_endpoints()
             sell_result = await execute_sell(
@@ -1283,10 +1340,10 @@ async def sell_real(token_id: int, *, source: str = 'auto_sell', simulate: bool 
             
             # Failed - reduce amount by 1% for next attempt
             if attempt < max_retries - 1:
-                next_amount = floor(current_amount * 0.99)
-                if next_amount == current_amount and current_amount > 1:
-                    next_amount -= 1
-                current_amount = max(next_amount, 1)
+                next_raw = int(current_raw * 0.99)
+                if next_raw == current_raw and current_raw > 1:
+                    next_raw -= 1
+                current_raw = max(next_raw, 1)
                 # Wait before next retry to avoid Jupiter rate limiting
                 await asyncio.sleep(random.uniform(*RETRY_DELAY))
                 # Continue to next retry
@@ -1529,6 +1586,46 @@ async def finalize_token_sale(token_id: int, conn, reason: str = 'auto') -> bool
 
 
 # Router functions for HTTP endpoints
+async def _should_skip_force_sell(token_id: int) -> Optional[str]:
+    """Return message if force sell should be skipped because position already closed."""
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        open_position = await conn.fetchval(
+            """
+            SELECT id FROM wallet_history
+            WHERE token_id=$1 AND exit_iteration IS NULL
+            LIMIT 1
+            """,
+            token_id,
+        )
+        if open_position:
+            return None
+
+        had_any_position = await conn.fetchval(
+            """
+            SELECT id FROM wallet_history
+            WHERE token_id=$1
+            LIMIT 1
+            """,
+            token_id,
+        )
+        if not had_any_position:
+            # Token was never purchased — let sell_real handle purge/archive path.
+            return None
+
+        token_row = await conn.fetchrow(
+            "SELECT wallet_id FROM tokens WHERE id=$1",
+            token_id,
+        )
+        if not token_row:
+            return "Token already archived"
+
+        if token_row.get("wallet_id") is None:
+            return "Position already closed"
+
+        return None
+
+
 async def force_sell(token_id: int, simulate: bool = False) -> dict:
     """Router: Force sell (REAL trading only, or SIMULATED if simulate=True).
     
@@ -1544,6 +1641,10 @@ async def force_sell(token_id: int, simulate: bool = False) -> dict:
     
     If simulate=True, transaction is simulated without actually sending to blockchain.
     """
+    skip_reason = await _should_skip_force_sell(token_id)
+    if skip_reason:
+        return {"success": True, "message": skip_reason, "token_id": token_id}
+
     sim_status = " (SIMULATED)" if simulate else ""
     print(f"[force_sell] 🚀 Force sell{sim_status} called for token {token_id}")
     try:
@@ -1831,15 +1932,16 @@ async def buy_real(token_id: int, *, source: str = 'auto_buy', simulate: bool = 
 
         # After transaction is confirmed, reconcile quantities/fees with on-chain data (Helius)
         if history_id and not simulate:
-            await _update_real_buy_metrics(
-                conn=conn,
-                history_id=history_id,
-                token_id=token_id,
-                wallet_id=key_id,
-                wallet_address=str(keypair.pubkey()),
-                signature=signature,
-                token_address=token_address,
-                token_decimals=token_decimals
+            asyncio.create_task(
+                _update_real_buy_metrics(
+                    history_id=history_id,
+                    token_id=token_id,
+                    wallet_id=key_id,
+                    wallet_address=str(keypair.pubkey()),
+                    signature=signature,
+                    token_address=token_address,
+                    token_decimals=token_decimals,
+                )
             )
         
         return {
@@ -1960,7 +2062,6 @@ def _extract_token_amount_from_tx(tx_data: Dict[str, Any], wallet_address: str, 
 
 
 async def _update_real_buy_metrics(
-    conn,
     history_id: int,
     token_id: int,
     wallet_id: int,
@@ -1988,28 +2089,30 @@ async def _update_real_buy_metrics(
     fee_sol = total_fee_lamports / LAMPORTS_PER_SOL if total_fee_lamports else None
     fee_usd = fee_sol * get_current_sol_price() if fee_sol else None
 
-    try:
-        await conn.execute(
-            """
-            UPDATE wallet_history
-            SET
-                entry_token_amount = COALESCE($2, entry_token_amount),
-                entry_transaction_fee_sol = COALESCE($3, entry_transaction_fee_sol),
-                entry_transaction_fee_usd = COALESCE($4, entry_transaction_fee_usd),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $1
-            """,
-            history_id,
-            actual_token_amount,
-            fee_sol,
-            fee_usd,
-        )
-        if actual_token_amount is not None:
-            print(f"[buy_real] ♻️ wallet_history#{history_id}: token amount reconciled to {actual_token_amount:.8f}")
-        if fee_sol is not None:
-            print(f"[buy_real] ♻️ wallet_history#{history_id}: fee updated to {fee_sol:.9f} SOL")
-    except Exception as e:
-        print(f"[buy_real] ⚠️ Failed to update wallet_history with real metrics: {e}")
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute(
+                """
+                UPDATE wallet_history
+                SET
+                    entry_token_amount = COALESCE($2, entry_token_amount),
+                    entry_transaction_fee_sol = COALESCE($3, entry_transaction_fee_sol),
+                    entry_transaction_fee_usd = COALESCE($4, entry_transaction_fee_usd),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                history_id,
+                actual_token_amount,
+                fee_sol,
+                fee_usd,
+            )
+            if actual_token_amount is not None:
+                print(f"[buy_real] ♻️ wallet_history#{history_id}: token amount reconciled to {actual_token_amount:.8f}")
+            if fee_sol is not None:
+                print(f"[buy_real] ♻️ wallet_history#{history_id}: fee updated to {fee_sol:.9f} SOL")
+        except Exception as e:
+            print(f"[buy_real] ⚠️ Failed to update wallet_history with real metrics: {e}")
 
 
 # =============================================================================

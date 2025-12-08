@@ -3,6 +3,7 @@
 import asyncio
 import aiohttp
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Sequence
 
@@ -18,7 +19,7 @@ from ai.pattern_segments import (
     feature_vector_for_segments,
     extract_series,
 )
-from _v2_buy_sell import finalize_token_sale, buy_real, sell_real
+from _v2_buy_sell import finalize_token_sale, buy_real, sell_real, _archive_or_purge_token
 from _v3_db_utils import get_token_iterations_count, evaluate_holder_momentum
 from _v3_trade_type_checker import check_token_has_real_trading
 
@@ -302,14 +303,15 @@ class JupiterAnalyzerV3:
         decision = "buy" if self._segments_allow_entry(predicted) else "not"
 
         # Trade Type Check: Verify real trading (SWAP) vs only transfers (TRANSFER)
-        # Check at three points: after segment 1 (35s), segment 2 (85s), and segment 3 (170s)
-        # This prevents entering tokens that only have transfers (no real market)
+        # Check at later segment boundaries (250s, 700s, 1000s)
+        # Note: Early check at 20s is done in save_token_data after metrics are written
         try:
             if iterations_count is None:
                 iterations_count = await get_token_iterations_count(conn, token_id)
             
-            # Check points: segment boundaries (250s, 700s, 1000s)
+            # Check points: original segment boundaries (250s, 700s, 1000s)
             check_points = [250, 700, 1000]
+            first_entry_checkpoint = check_points[0]
             
             # Determine which check point we're at
             current_check_point = None
@@ -341,11 +343,11 @@ class JupiterAnalyzerV3:
                         if token_pair:
                             try:
                                 has_real_trading_result = await check_token_has_real_trading(token_id, token_pair, save_to_db=True)
-                                if not has_real_trading_result:
+                                if has_real_trading_result is False:
                                     decision = "not"
                             except Exception:
                                 decision = "not"
-                        if has_real_trading_result is not None and current_check_point >= 85:
+                        if has_real_trading_result is not None and current_check_point >= first_entry_checkpoint:
                             await conn.execute(
                                 """
                                 UPDATE tokens
@@ -723,6 +725,9 @@ class JupiterAnalyzerV3:
                 return None
 
         try:
+            # Define ts early to avoid NameError when used in live_seconds_value calculation
+            ts = int(time.time())
+            
             pool = await get_db_pool()
             async with pool.acquire() as conn:
                 await conn.execute("""
@@ -806,9 +811,28 @@ class JupiterAnalyzerV3:
 
                 first_pool = data.get('firstPool', {})
                 candidate_pair = first_pool.get('id')
-                row = await conn.fetchrow("SELECT token_address, token_pair FROM tokens WHERE id = $1", token_id)
+                row = await conn.fetchrow(
+                    "SELECT token_address, token_pair, first_pool_created_at, created_at FROM tokens WHERE id = $1",
+                    token_id
+                )
                 token_addr = row['token_address'] if row else None
                 current_pair = row['token_pair'] if row else None
+                origin_dt = None
+                if row:
+                    origin_dt = row.get('first_pool_created_at') or row.get('created_at')
+                origin_epoch = None
+                if origin_dt:
+                    try:
+                        if isinstance(origin_dt, datetime):
+                            if origin_dt.tzinfo:
+                                origin_epoch = int(origin_dt.timestamp())
+                            else:
+                                origin_epoch = int(origin_dt.replace(tzinfo=timezone.utc).timestamp())
+                        else:
+                            # Fallback: parse via datetime if string
+                            origin_epoch = int(datetime.fromisoformat(str(origin_dt)).replace(tzinfo=timezone.utc).timestamp())
+                    except Exception:
+                        origin_epoch = None
                 updated_pair = None
                 if candidate_pair and token_addr and candidate_pair != token_addr:
                     if current_pair != candidate_pair:
@@ -818,6 +842,10 @@ class JupiterAnalyzerV3:
                             candidate_pair,
                         )
                         updated_pair = candidate_pair
+                live_seconds_value = None
+                if origin_epoch is not None:
+                    live_seconds_value = max(0, ts - origin_epoch)
+
                 if (
                     not updated_pair and self._fallback_left > 0 and
                     (not current_pair or current_pair == token_addr or not candidate_pair or candidate_pair == token_addr)
@@ -856,7 +884,7 @@ class JupiterAnalyzerV3:
 
                 # Завжди записуємо метрики в token_metrics_seconds
                 try:
-                    ts = int(time.time())
+                    # ts already defined at function start, reuse it here
                     usd_p = float(data.get('usdPrice', 0)) if data.get('usdPrice') is not None else None
                     liq = float(data.get('liquidity', 0)) if data.get('liquidity') is not None else None
                     fdv = float(data.get('fdv', 0)) if data.get('fdv') is not None else None
@@ -904,6 +932,42 @@ class JupiterAnalyzerV3:
                         )
                     except Exception:
                         pass
+
+                    # Early check at 20 seconds: if no swaps, purge token immediately
+                    # This check happens AFTER metrics are written to ensure we have data
+                    iterations_for_check = await get_token_iterations_count(conn, token_id)
+                    if iterations_for_check >= 20:
+                        already_checked = await conn.fetchval(
+                            "SELECT has_real_trading FROM tokens WHERE id=$1",
+                            token_id
+                        )
+                        # Only check if not checked yet
+                        if already_checked is None:
+                            token_pair_row = await conn.fetchrow(
+                                "SELECT token_pair FROM tokens WHERE id=$1",
+                                token_id
+                            )
+                            token_pair = token_pair_row.get('token_pair') if token_pair_row else None
+                            
+                            if token_pair:
+                                try:
+                                    has_real_trading_result = await check_token_has_real_trading(token_id, token_pair, save_to_db=True)
+                                    if has_real_trading_result is False:
+                                        # No swaps found - purge token immediately
+                                        await _archive_or_purge_token(conn, token_id, iterations_for_check)
+                                        return True  # Exit early, token is being purged
+                                except Exception:
+                                    # On error, purge token to be safe
+                                    await _archive_or_purge_token(conn, token_id, iterations_for_check)
+                                    return True
+                            elif not token_pair:
+                                # No pair found - purge token
+                                await _archive_or_purge_token(conn, token_id, iterations_for_check)
+                                return True
+                        elif already_checked is False:
+                            # Already checked and no swaps - token should be purged, but if still here, purge now
+                            await _archive_or_purge_token(conn, token_id, iterations_for_check)
+                            return True
 
                     ai_active = True
                     max_ai_age = int(getattr(config, 'ETA_MAX_TOKEN_AGE_SEC', 0) or 0)
@@ -961,8 +1025,44 @@ class JupiterAnalyzerV3:
                 # Rug/drained-liquidity guard: if last N consecutive seconds are zero/NULL OR flat (same values)
                 # (both usd_price and mcap are NULL/0 OR flat) and there is an open position in wallet_history
                 # → close dead token at price 0
+                total_points = 0
+                try:
+                    total_points = int(
+                        await conn.fetchval(
+                            """
+                            SELECT COUNT(*)
+                            FROM token_metrics_seconds
+                            WHERE token_id=$1
+                            """,
+                            token_id,
+                        )
+                        or 0
+                    )
+                except Exception:
+                    total_points = 0
+
+                async def _flag_zero_tail(total_iter: int):
+                    try:
+                        await conn.execute(
+                            """
+                            UPDATE tokens
+                            SET zero_tail_detected_iter = COALESCE(zero_tail_detected_iter, $2),
+                                cleaner_flagged = TRUE,
+                                cleaner_flag_reason = 'zero_tail',
+                                cleaner_flag_iteration = COALESCE(cleaner_flag_iteration, $2),
+                                cleaner_flagged_at = CURRENT_TIMESTAMP
+                            WHERE id = $1
+                            """,
+                            token_id,
+                            total_iter,
+                        )
+                    except Exception:
+                        pass
+
                 zero_tail_triggered = False
                 zero_tail = int(getattr(config, 'ZERO_TAIL_CONSEC_SEC', 20))
+                zero_tail_fill_ratio = float(getattr(config, 'ZERO_TAIL_MIN_FILL_RATIO', 0) or 0.0)
+                zero_tail_fill_life = int(getattr(config, 'ZERO_TAIL_MIN_FILL_LIFE_SEC', 0) or 0)
                 try:
                     if zero_tail > 0:
                         row = await conn.fetchrow(
@@ -982,59 +1082,35 @@ class JupiterAnalyzerV3:
                         )
                         pos_cnt = int(row['pos_cnt'] or 0) if row else 0
                         total = int(row['total'] or 0) if row else 0
-                        total_points = int(
-                            await conn.fetchval(
-                                """
-                                SELECT COUNT(*)
-                                FROM token_metrics_seconds
-                                WHERE token_id=$1
-                                """,
-                                token_id,
-                            )
-                            or 0
-                        )
                         if total >= zero_tail and pos_cnt == 0:
-                            open_position = await conn.fetchrow(
-                                """
-                                SELECT id, wallet_id, entry_token_amount
-                                FROM wallet_history
-                                WHERE token_id=$1 AND exit_iteration IS NULL
-                                LIMIT 1
-                                """,
-                                token_id
-                            )
+                            await _flag_zero_tail(total_points)
                             zero_tail_triggered = True
-                            try:
-                                await conn.execute(
-                                    """
-                                    UPDATE tokens
-                                    SET zero_tail_detected_iter = COALESCE(zero_tail_detected_iter, $2),
-                                        cleaner_flagged = TRUE,
-                                        cleaner_flag_reason = 'zero_tail',
-                                        cleaner_flag_iteration = COALESCE(cleaner_flag_iteration, $2),
-                                        cleaner_flagged_at = CURRENT_TIMESTAMP
-                                    WHERE id = $1
-                                    """,
-                                    token_id,
-                                    total_points,
-                                )
-                            except Exception:
-                                pass
                 except Exception:
                     pass
-                finally:
-                    if zero_tail > 0 and not zero_tail_triggered:
-                        try:
-                            await conn.execute(
-                                """
-                                UPDATE tokens
-                                SET zero_tail_detected_iter = NULL
-                                WHERE id=$1 AND zero_tail_detected_iter IS NOT NULL
-                                """,
-                                token_id,
-                            )
-                        except Exception:
-                            pass
+
+                if (
+                    not zero_tail_triggered
+                    and zero_tail_fill_ratio > 0
+                    and live_seconds_value is not None
+                    and live_seconds_value >= zero_tail_fill_life
+                    and live_seconds_value > 0
+                ):
+                    fill_ratio = total_points / max(1, live_seconds_value)
+                    if fill_ratio <= zero_tail_fill_ratio:
+                        await _flag_zero_tail(total_points)
+                        zero_tail_triggered = True
+                if zero_tail > 0 and not zero_tail_triggered:
+                    try:
+                        await conn.execute(
+                            """
+                            UPDATE tokens
+                            SET zero_tail_detected_iter = NULL
+                            WHERE id=$1 AND zero_tail_detected_iter IS NOT NULL
+                            """,
+                            token_id,
+                        )
+                    except Exception:
+                        pass
 
                 # Frozen price detection: цена не менялась N итераций
                 frozen_triggered = False

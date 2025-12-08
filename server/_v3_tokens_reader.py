@@ -2,8 +2,8 @@
 
 import asyncio
 import json
-from datetime import datetime
-from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional, Tuple
 import os
 from ai.patterns.catalog import PATTERN_SEED
 from fastapi import WebSocket
@@ -386,10 +386,12 @@ class TokensReaderV3:
                     # Get pattern score for sorting (higher score = better pattern)
                     pattern_score = code_to_score.get(pattern_code, 0)
                     
-                    # Check if token is archived (archived tokens are in tokens_history table)
-                    is_archived = tokens_table == "tokens_history"
                     created_at = row['created_at']
+                    first_pool_created_at = row.get('first_pool_created_at')
+                    archived_at = row.get('archived_at')
                     iteration_count = int(row['iteration_count']) if row['iteration_count'] else 0
+                    live_origin = first_pool_created_at or created_at
+                    live_seconds, live_time_label = self._calculate_live_duration(live_origin, archived_at)
                     
                     price_change_5m = float(row['price_change_5m']) if row['price_change_5m'] else None
                     holder_change_5m = float(row['holder_change_5m']) if row['holder_change_5m'] else None
@@ -587,8 +589,9 @@ class TokensReaderV3:
                         "num_traders_24h": num_traders_24h,
                         "security_analyzed_at": None,
                         "updated_at": None,
-                        "created_at": created_at.isoformat() if created_at else None,
-                    "live_time": self._calculate_live_time(iteration_count, is_archived),
+                        "created_at": created_at.isoformat() if isinstance(created_at, datetime) else (str(created_at) if created_at else None),
+                        "live_seconds": live_seconds,
+                        "live_time": live_time_label,
                         "wallet_id": int(wallet_id) if wallet_id is not None else None,
                         "entry_token_amount": entry_token_amount,
                         "entry_price_usd": entry_price_usd,
@@ -769,6 +772,11 @@ class TokensReaderV3:
                 pattern_display = code_to_name.get(pattern_code) or p_name or (pattern_code.replace('_',' ').title() if pattern_code else "")
                 pattern_score = code_to_score.get(pattern_code, 0)
 
+                created_at = row['created_at']
+                first_pool_created_at = row.get('first_pool_created_at')
+                archived_at = row.get('archived_at')
+                live_seconds, live_time_label = self._calculate_live_duration(first_pool_created_at or created_at, archived_at)
+
                 token = {
                     "id": row['id'],
                     "token_address": row['token_address'],
@@ -852,8 +860,9 @@ class TokensReaderV3:
                     # If token is found, it's not archived
                     "security_analyzed_at": None,
                     "updated_at": None,
-                    "created_at": row['created_at'].isoformat() if row['created_at'] else None,
-                    "live_time": self._calculate_live_time(int(row['iteration_count']) if row['iteration_count'] else 0, False),
+                    "created_at": created_at.isoformat() if isinstance(created_at, datetime) else (str(created_at) if created_at else None),
+                    "live_seconds": live_seconds,
+                    "live_time": live_time_label,
                     "wallet_id": row.get('wallet_id'),
                     "entry_token_amount": float(row['entry_token_amount']) if row.get('entry_token_amount') else None,
                     "entry_price_usd": float(row['entry_price_usd']) if row.get('entry_price_usd') else None,
@@ -1102,21 +1111,44 @@ class TokensReaderV3:
             #     print(f"[TokensReader] push_now error: {e}")
             pass
     
-    def _calculate_live_time(self, iteration_count, is_archived):
-        """Calculate live time from iteration count (each iteration = 1 second)"""
-        
-        if iteration_count is None or iteration_count == 0:
+    def _normalize_timestamp(self, value: Any) -> Optional[datetime]:
+        """Convert DB timestamp/ISO strings into naive UTC datetime objects."""
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo:
+                return value.astimezone(timezone.utc).replace(tzinfo=None)
+            return value
+        try:
+            parsed = datetime.fromisoformat(str(value))
+            if parsed.tzinfo:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed
+        except Exception:
+            return None
+
+    def _calculate_live_duration(self, origin_ts: Optional[Any], archived_ts: Optional[Any]) -> Tuple[int, str]:
+        """Return (seconds, human label) between token birth and now/archival."""
+        origin = self._normalize_timestamp(origin_ts)
+        if origin is None:
+            # No reliable timestamp — treat as live but unknown duration
+            return 0, "Live"
+        target = self._normalize_timestamp(archived_ts)
+        if target is None:
+            target = datetime.utcnow()
+        total_seconds = max(0, int((target - origin).total_seconds()))
+        return total_seconds, self._format_live_time(total_seconds, archived_ts is not None)
+
+    def _format_live_time(self, total_seconds: int, is_archived: bool) -> str:
+        """Format seconds into compact duration label."""
+        if total_seconds <= 0:
             return "Ended" if is_archived else "Live"
-        
-        total_seconds = iteration_count
-        
-        # Handle different time ranges
-        diff_days = total_seconds // 86400  # 86400 seconds = 1 day
-        diff_hours = (total_seconds % 86400) // 3600  # remaining hours
-        diff_minutes = (total_seconds % 3600) // 60  # remaining minutes
+
+        diff_days = total_seconds // 86400
+        diff_hours = (total_seconds % 86400) // 3600
+        diff_minutes = (total_seconds % 3600) // 60
         remaining_seconds = total_seconds % 60
-        
-        # Build time string based on duration
+
         if diff_days > 0:
             time_str = f"{diff_days}d {diff_hours}h {diff_minutes}m"
         elif diff_hours > 0:
@@ -1125,7 +1157,7 @@ class TokensReaderV3:
             time_str = f"{diff_minutes}m {remaining_seconds}s"
         else:
             time_str = f"{remaining_seconds}s"
-        
+
         return f"Ended ({time_str})" if is_archived else f"Live {time_str}"
 
     

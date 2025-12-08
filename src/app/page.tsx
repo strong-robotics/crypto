@@ -30,6 +30,7 @@ type RawTokenMessage = {
   stats_24h_num_buys?: number;
   stats_24h_num_sells?: number;
   history_ready?: boolean | string | number | null;
+  live_seconds?: number | string | null;
   iteration_count?: number | string | null;
   // V3 Jupiter analyzer fields
   num_buys_24h?: number;
@@ -393,11 +394,11 @@ export default function Home() {
             setTokens(prevTokens => {
               const byId = new Map(prevTokens.map(t => [t.id, t]));
               const formattedTokens: TokenState[] = (tokenData.tokens || []).map((token, index) => {
-              const iterationCountRaw = token.iteration_count;
+              const liveSecondsRaw = token.live_seconds ?? token.iteration_count;
               const liveSecondsValue = (() => {
-                if (iterationCountRaw === null || iterationCountRaw === undefined) return NaN;
-                if (typeof iterationCountRaw === "number") return iterationCountRaw;
-                const parsed = Number(iterationCountRaw);
+                if (liveSecondsRaw === null || liveSecondsRaw === undefined) return NaN;
+                if (typeof liveSecondsRaw === "number") return liveSecondsRaw;
+                const parsed = Number(liveSecondsRaw);
                 return Number.isFinite(parsed) ? parsed : NaN;
               })();
               const prev = byId.get(token.id);

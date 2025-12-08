@@ -170,26 +170,19 @@ async def _find_no_swap_tokens(conn, limit: int) -> List[int]:
 
 
 async def _find_no_pair_tokens(conn, min_iterations: int, limit: int) -> List[int]:
-    """Catch tokens без пары и с достаточным числом метрик (итераций)."""
-    if limit <= 0 or min_iterations <= 0:
+    """Catch tokens без торговой пары – простой обход таблицы tokens."""
+    if limit <= 0:
         return []
     rows = await conn.fetch(
         """
-        WITH metric_counts AS (
-            SELECT token_id, COUNT(*) AS cnt
-            FROM token_metrics_seconds
-            GROUP BY token_id
-        )
-        SELECT t.id
-        FROM tokens t
-        JOIN metric_counts mc ON mc.token_id = t.id
-        WHERE (t.token_pair IS NULL OR t.token_pair = t.token_address)
-          AND mc.cnt >= $2
-        ORDER BY mc.cnt DESC, t.id ASC
+        SELECT id
+        FROM tokens
+        WHERE (token_pair IS NULL OR token_pair = token_address)
+          AND (wallet_id IS NULL OR wallet_id = 0)
+        ORDER BY id ASC
         LIMIT $1
         """,
         limit,
-        min_iterations,
     )
     return [int(r["id"]) for r in rows]
 
@@ -250,8 +243,6 @@ async def _drain_no_pair_tokens(conn, min_iterations: int, batch_size: int) -> i
             break
         removed = await _move_to_bad_tables(conn, ids, "no_pair")
         total += removed
-        if len(ids) < batch_size:
-            break
     # if total > 0:
         # remaining = await _count_no_pair_tokens(conn)
         # print(
@@ -434,37 +425,42 @@ async def _ensure_bad_tables(conn) -> None:
 async def _move_to_bad_tables(conn, ids: List[int], reason: str) -> int:
     if not ids:
         return 0
-    await conn.execute(
-        """
-        DELETE FROM bad_tokens bt
-        USING tokens t
-        WHERE t.id = ANY($1)
-          AND bt.token_address = t.token_address
-        """,
-        ids,
-    )
-    await conn.execute(
-        """
-        INSERT INTO bad_tokens
-        SELECT t.*, $2 AS removed_reason, CURRENT_TIMESTAMP AS removed_at
-        FROM tokens t
-        WHERE t.id = ANY($1)
-        ON CONFLICT (id) DO UPDATE
-        SET removed_reason = EXCLUDED.removed_reason,
-            removed_at = CURRENT_TIMESTAMP
-        """,
-        ids,
-        reason,
-    )
-    await conn.execute(
-        """
-        INSERT INTO bad_token_metrics
-        SELECT *
-        FROM token_metrics_seconds
-        WHERE token_id = ANY($1)
-        """,
-        ids,
-    )
+    # current_ids = await conn.fetch("SELECT id FROM tokens ORDER BY id")
+    # current_list = [int(row["id"]) for row in current_ids]
+    # print(f"[Cleaner] current tokens={current_list}")
+    # print(f"[Cleaner] removing tokens {ids} reason={reason}")
+    if reason not in ("no_pair", "transfer_only"):
+        await conn.execute(
+            """
+            DELETE FROM bad_tokens bt
+            USING tokens t
+            WHERE t.id = ANY($1)
+              AND bt.token_address = t.token_address
+            """,
+            ids,
+        )
+        await conn.execute(
+            """
+            INSERT INTO bad_tokens
+            SELECT t.*, $2 AS removed_reason, CURRENT_TIMESTAMP AS removed_at
+            FROM tokens t
+            WHERE t.id = ANY($1)
+            ON CONFLICT (id) DO UPDATE
+            SET removed_reason = EXCLUDED.removed_reason,
+                removed_at = CURRENT_TIMESTAMP
+            """,
+            ids,
+            reason,
+        )
+        await conn.execute(
+            """
+            INSERT INTO bad_token_metrics
+            SELECT *
+            FROM token_metrics_seconds
+            WHERE token_id = ANY($1)
+            """,
+            ids,
+        )
     await _purge_batch(conn, ids)
     return len(ids)
 
@@ -477,6 +473,7 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
         await _ensure_bad_tables(conn)
         locked = await _acquire_lock(conn)
         if not locked:
+            print("[Cleaner] ⚠️ Could not acquire advisory lock; another instance is running")
             return {"success": False, "message": "another cleaner is running"}
         try:
             holder_iter_threshold = int(getattr(config, "CLEANER_LOW_HOLDER_ITER_THRESHOLD", 0) or 0)
@@ -502,6 +499,7 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
             else:
                 removed = await _drain_no_swap_tokens(conn, limit)
                 if removed:
+                    print(f"[Cleaner] removed no_swap={removed}")
                     bad_removed["no_swap"] = bad_removed.get("no_swap", 0) + removed
 
             if dry_run:
@@ -512,6 +510,7 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
             else:
                 removed = await _drain_no_pair_tokens(conn, older_than_sec, limit)
                 if removed:
+                    # print(f"[Cleaner] removed no_pair={removed}")
                     bad_removed["no_pair"] = bad_removed.get("no_pair", 0) + removed
 
             zero_tail_candidates = await _find_flagged_tokens(conn, "zero_tail", remaining)
@@ -522,8 +521,10 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
                 else:
                     archived, removed = await _process_flagged_tokens(conn, zero_tail_candidates, "zero_tail", archive_threshold)
                     if archived:
+                        print(f"[Cleaner] archived zero_tail={archived}")
                         archived_summary["zero_tail"] = archived_summary.get("zero_tail", 0) + archived
                     if removed:
+                        print(f"[Cleaner] removed zero_tail={removed}")
                         bad_removed["zero_tail"] = bad_removed.get("zero_tail", 0) + removed
                 remaining = max(0, remaining - len(zero_tail_candidates))
 
@@ -535,8 +536,10 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
                 else:
                     archived, removed = await _process_flagged_tokens(conn, frozen_candidates, "frozen_price", archive_threshold)
                     if archived:
+                        print(f"[Cleaner] archived frozen_price={archived}")
                         archived_summary["frozen_price"] = archived_summary.get("frozen_price", 0) + archived
                     if removed:
+                        print(f"[Cleaner] removed frozen_price={removed}")
                         bad_removed["frozen_price"] = bad_removed.get("frozen_price", 0) + removed
                 remaining = max(0, remaining - len(frozen_candidates))
 

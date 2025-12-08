@@ -121,7 +121,7 @@ async def _resolve_token_decimals(token_address: str, override: Optional[int]) -
     return 6
 
 
-async def _get_token_balance(keypair: Keypair, token_address: str, token_decimals: int) -> float:
+async def _get_token_balance(keypair: Keypair, token_address: str, token_decimals: int) -> tuple[float, int]:
     rpc = _resolve_rpc_endpoint()
     payload = {
         "jsonrpc": "2.0",
@@ -137,37 +137,55 @@ async def _get_token_balance(keypair: Keypair, token_address: str, token_decimal
         async with session.post(rpc, json=payload) as resp:
             data = await resp.json(content_type=None)
             if "result" not in data:
-                return 0.0
+                return 0.0, 0
             accounts = data["result"].get("value", [])
-            total = 0.0
+            total_raw = 0
+            decimals_used = token_decimals
             for acc in accounts:
-                ui = (
+                token_amount = (
                     acc.get("account", {})
                     .get("data", {})
                     .get("parsed", {})
                     .get("info", {})
                     .get("tokenAmount", {})
-                    .get("uiAmount")
                 )
-                if ui is not None:
-                    total += float(ui)
-            return total
+                if not token_amount:
+                    continue
+                decimals_rpc = token_amount.get("decimals")
+                if decimals_rpc is not None:
+                    decimals_used = decimals_rpc
+                amount_raw = token_amount.get("amount")
+                if amount_raw is not None:
+                    try:
+                        total_raw += int(amount_raw)
+                        continue
+                    except Exception:
+                        pass
+                ui_value = token_amount.get("uiAmount")
+                if ui_value is not None:
+                    total_raw += int(round(float(ui_value) * (10 ** token_decimals)))
+            if total_raw <= 0:
+                return 0.0, 0
+            total = total_raw / (10 ** decimals_used)
+            return float(total), total_raw
 
 
-async def _get_token_balance_with_retry(keypair: Keypair, token_address: str, token_decimals: int) -> float:
+async def _get_token_balance_with_retry(keypair: Keypair, token_address: str, token_decimals: int) -> tuple[float, int]:
     """
     Wallet balance may still be zero immediately after a buy. Poll for a short period.
     """
     attempts = max(BALANCE_RETRY_ATTEMPTS, 1)
     delay = max(BALANCE_RETRY_DELAY, 0.0)
+    balance = 0.0
+    raw = 0
     for attempt in range(1, attempts + 1):
-        balance = await _get_token_balance(keypair, token_address, token_decimals)
-        if balance > 0:
-            return balance
+        balance, raw = await _get_token_balance(keypair, token_address, token_decimals)
+        if raw > 0:
+            return balance, raw
         if attempt < attempts and delay > 0:
             print(f"[ManualSell] ⏳ Awaiting token balance (attempt {attempt}/{attempts}); retrying in {delay:.2f}s")
             await asyncio.sleep(delay)
-    return balance
+    return balance, raw
 
 
 async def _fetch_quote(session: aiohttp.ClientSession, token_address: str, amount_raw: int, slippage_bps: int):
@@ -261,28 +279,20 @@ async def manual_sell(args):
 
     decimals = await _resolve_token_decimals(args.token_address, args.decimals)
 
+    balance_raw = None
     if args.amount.lower() == "all":
-        balance = await _get_token_balance_with_retry(keypair, args.token_address, decimals)
-        if balance <= 0:
+        balance, balance_raw = await _get_token_balance_with_retry(keypair, args.token_address, decimals)
+        if balance_raw is None or balance_raw <= 0:
             raise RuntimeError("Token balance is zero")
         amount_tokens = balance
+        amount_raw = balance_raw
     else:
         amount_tokens = float(args.amount)
-    # Sell whole tokens only (drop fractional part)
-    whole_tokens = int(amount_tokens)
-    if whole_tokens <= 0:
-        raise RuntimeError("Amount too small after truncation to whole tokens")
-    if amount_tokens - whole_tokens > 0:
-        print(f"[ManualSell] ℹ️ Truncated fractional part ({amount_tokens - whole_tokens:.6f} tokens). Selling {whole_tokens} tokens.")
-    else:
-        print(f"[ManualSell] Selling amount: {whole_tokens} tokens")
-    if whole_tokens <= 0:
-        print("[ManualSell] ⚠️ Balance below 1 token — nothing to sell.")
-        return
+        amount_raw = int(round(amount_tokens * (10 ** decimals)))
+    if amount_tokens <= 0 or amount_raw <= 0:
+        raise RuntimeError("Amount too small to sell")
 
-    amount_tokens = float(whole_tokens)
-    amount_raw = amount_tokens * (10 ** decimals)
-    amount_raw = int(amount_raw)
+    print(f"[ManualSell] Selling amount: {amount_tokens:.8f} tokens")
     if amount_raw <= 0:
         raise RuntimeError("Amount too small after decimals conversion")
 

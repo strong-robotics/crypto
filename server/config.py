@@ -244,6 +244,8 @@ class Config:
     # consider token dead. If no entry happened yet → hard delete token (+metrics/trades).
     # If entry happened → finalize position at price 0 and archive token.
     ZERO_TAIL_CONSEC_SEC = 120  # нужно 120 последовательных пустых итераций, чтобы признать токен «мертвым»
+    ZERO_TAIL_MIN_FILL_RATIO = 0.40  # если фактических секунд < 40% от реального возраста → считаем график мертвым
+    ZERO_TAIL_MIN_FILL_LIFE_SEC = 180  # проверять fill ratio только после 3 минут жизни токена
     # Do NOT trigger zero-liquidity guard until token прожил минимум столько секунд.
     CLEANER_LOW_HOLDER_ITER_THRESHOLD = 500  # минимальное количество итераций для low-holder архивации
     CLEANER_LOW_HOLDER_MIN_COUNT = 300       # минимальное число холдеров для long-lived токена

@@ -165,10 +165,13 @@ export function TokenCell({
       ? liveSeconds
       : null;
   const statusSeconds =
-    chartSeconds !== null
-      ? chartSeconds
-      : liveSecondsNumeric;
-  const statusLabel = statusSeconds !== null ? `${statusSeconds}s` : '0s';
+    liveSecondsNumeric !== null
+      ? liveSecondsNumeric
+      : chartSeconds;
+  const statusLabel =
+    typeof live_time === 'string' && live_time.length > 0
+      ? live_time
+      : (statusSeconds !== null ? `${statusSeconds}s` : '0s');
   const statusColor = isArchived ? '#6b7280' : '#10b981';
 
   const latestPriceFromChart = (Array.isArray(chartData) && chartData.length > 0)
