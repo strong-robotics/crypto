@@ -76,8 +76,12 @@ interface TokenCellProps {
   plan_sell_iteration?: number | null;  // Запланована ітерація продажу
   plan_sell_price_usd?: number | null;  // Запланована ціна продажу
   cur_income_price_usd?: number | null;  // Поточна вартість портфеля (USD)
+  cur_income_price_sol?: number | null;  // Поточна вартість портфеля (SOL)
+  profit_pct_sol?: number | null;  // Відсоток приросту портфеля в SOL
+  entry_sol_price?: number | null;  // Курс SOL при покупці
   has_real_trading?: boolean | null;  // NULL = not checked, TRUE = has SWAP, FALSE = transfer only
   medianAmountUsd?: number | null; // Медіанна сума угоди (USD)
+  targetReturn?: number;  // TARGET_RETURN from backend config
 }
 
 
@@ -116,8 +120,12 @@ export function TokenCell({
   plan_sell_iteration,
   plan_sell_price_usd,
   cur_income_price_usd,
+  cur_income_price_sol,
+  profit_pct_sol,
+  entry_sol_price,
   has_real_trading,
-  medianAmountUsd
+  medianAmountUsd,
+  targetReturn = 0.2  // Default to 0.2 (20%) if not provided, but should come from backend config
 }: TokenCellProps) {
   // Всі значення приходять з бекенду
   const ENTRY_SEC: number | null = (typeof entry_iteration === 'number') ? entry_iteration : null;
@@ -245,19 +253,30 @@ export function TokenCell({
   const exitActualSec: number | null = (typeof exit_iteration === 'number') ? exit_iteration : null;
   const exitPlanSec: number | null = (typeof plan_sell_iteration === 'number') ? plan_sell_iteration : null;
   const chartExitSec: number | null = exitActualSec ?? exitPlanSec;
+  
+  // Calculate exit price per token: use actual exit price, or plan_sell_price_usd, or calculate from entry_price_usd with targetReturn from config
   const exitPricePerToken =
     exitActualSec !== null && typeof exit_price_usd === 'number'
       ? exit_price_usd
-      : (typeof plan_sell_price_usd === 'number' ? plan_sell_price_usd : null);
+      : (typeof plan_sell_price_usd === 'number' 
+          ? plan_sell_price_usd 
+          : (typeof entry_price_usd === 'number' && entry_price_usd > 0
+              ? entry_price_usd * (1.0 + targetReturn)
+              : null));
+  
   const exitTokens: number | null = exitActualSec !== null
     ? (typeof exit_token_amount === 'number'
         ? exit_token_amount
         : (typeof entry_token_amount === 'number' ? entry_token_amount : null))
     : (typeof entry_token_amount === 'number' ? entry_token_amount : null);
+  
+  // Calculate exit value: use exitTokens * exitPricePerToken, or fallback to entry_amount * (1 + targetReturn from config)
   const exitValueUsd =
     exitTokens !== null && exitPricePerToken !== null
       ? exitTokens * exitPricePerToken
-      : null;
+      : (investedUsd !== null && investedUsd > 0
+          ? investedUsd * (1.0 + targetReturn)
+          : null);
   const exitProfitUsd =
     exitValueUsd !== null && investedUsd !== null
       ? exitValueUsd - investedUsd
@@ -587,15 +606,22 @@ export function TokenCell({
                     }}>
                       $ {currentPortfolioValue.toFixed(2)}
                     </span>
-                    {/* {typeof currentProfitUsd === 'number' && (
+                    {investedUsd !== null && investedUsd > 0 && typeof currentPortfolioValue === 'number' && (
                       <div style={{
                         fontSize: '10px',
-                        color: currentProfitUsd >= 0 ? '#22c55e' : '#ef4444',
-                        marginTop: '2px'
+                        color: circleColor,
+                        marginTop: '2px',
+                        fontWeight: '500'
                       }}>
-                        {currentProfitUsd >= 0 ? '+' : '-'}${Math.abs(currentProfitUsd).toFixed(2)}
+                        {typeof profit_pct_sol === 'number' && Number.isFinite(profit_pct_sol) ? (
+                          // Show SOL-based profit percentage (more accurate for SOL accumulation goal)
+                          <span>{profit_pct_sol >= 0 ? '+' : ''}{profit_pct_sol.toFixed(1)}% SOL</span>
+                        ) : (
+                          // Fallback to USD-based calculation
+                          <span>{((currentPortfolioValue / investedUsd - 1) * 100) >= 0 ? '+' : ''}{((currentPortfolioValue / investedUsd - 1) * 100).toFixed(1)}%</span>
+                        )}
                       </div>
-                    )} */}
+                    )}
                   </div>
                 </div>
 

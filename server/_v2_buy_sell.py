@@ -15,7 +15,13 @@ from typing import Dict, Optional, Any, Tuple
 
 import aiohttp
 from solders.keypair import Keypair
-from solders.transaction import VersionedTransaction
+from solders.transaction import VersionedTransaction, Transaction
+from solders.instruction import AccountMeta, Instruction
+from solders.pubkey import Pubkey
+from solders.message import Message
+from solders.hash import Hash
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import TxOpts
 def _maybe_rerun_with_venv(exc: ModuleNotFoundError):
     """If asyncpg is missing, rerun script using venv python automatically."""
     if os.environ.get("BUYSELL_SKIP_VENV_RELAUNCH") == "1":
@@ -1136,12 +1142,15 @@ async def execute_sell(
             if not sell_success or not signature:
                 return {"success": False, "message": "Sell failed after all slippage retry attempts"}
             
+            # Calculate token price USD
+            token_price_usd = expected_usd / token_amount if token_amount > 0 else 0
+            
             result = {
                 "success": True,
                 "signature": signature,
                 "amount_sol": expected_sol,
                 "amount_usd": expected_usd,
-                "price_usd": token_price_usd if 'token_price_usd' in locals() else (expected_usd / token_amount if token_amount > 0 else 0)
+                "price_usd": token_price_usd
             }
             if simulate and final_tx_result:
                 result.update({
@@ -1364,8 +1373,187 @@ async def sell_real(token_id: int, *, source: str = 'auto_sell', simulate: bool 
         price_usd = sell_result.get("price_usd", 0.0)
         signature = sell_result.get("signature")
         
+        # Check actual balance after sell to calculate real amount sold
+        # This accounts for slippage/price impact that may leave dust
+        balance_after_ui, balance_after_raw = await get_token_balance(keypair, token_address, token_decimals)
+        balance_before_ui = token_amount  # Amount we tried to sell
+        actual_amount_sold = balance_before_ui - balance_after_ui
+        
+        # Update actual_amount_sold based on real balance change
+        if actual_amount_sold <= 0:
+            # Fallback: use the amount we tried to sell
+            actual_amount_sold = balance_before_ui
+        else:
+            print(f"[sell_real] 📊 Actual amount sold: {actual_amount_sold:.8f} tokens (balance before: {balance_before_ui:.8f}, after: {balance_after_ui:.8f})")
+        
         sim_status = " (SIMULATED)" if simulate else ""
         print(f"[sell_real] ✅ Force sell successful{sim_status} for token {token_id}: wallet_id={key_id}, amount=${actual_usd_received:.2f}, signature={signature}")
+        
+        # Try to close ATA in background (non-blocking) to reclaim Rent
+        # IMPORTANT: Wait for transaction confirmation before checking balance
+        if not simulate and signature:
+            async def _close_ata_background():
+                """Background task to close ATA and handle dust - doesn't block main sell flow"""
+                try:
+                    # Step 1: Wait for transaction confirmation
+                    print(f"[sell_real] ⏳ [Background] Waiting for transaction confirmation: {signature}")
+                    confirmed = await _wait_for_signature_confirmation(signature, timeout_sec=30.0, poll_interval=0.5)
+                    if not confirmed:
+                        print(f"[sell_real] ⚠️ [Background] Transaction {signature} not confirmed within timeout; skipping ATA close")
+                        return
+                    
+                    # Step 2: Wait 5 seconds before attempting to close ATA
+                    print(f"[sell_real] ⏳ [Background] Waiting 5 seconds before closing ATA...")
+                    await asyncio.sleep(5.0)
+                    
+                    # Step 3: First attempt to close ATA
+                    print(f"[sell_real] 🔄 [Background] Attempting to close ATA to reclaim Rent...")
+                    close_success, close_result = await _close_ata_after_sell(keypair, token_address, rpc_endpoint)
+                    
+                    if close_success:
+                        if isinstance(close_result, str) and len(close_result) > 50:  # Signature
+                            print(f"[sell_real] ✅ [Background] ATA closed successfully: {close_result}")
+                            print(f"[sell_real] 💰 [Background] Rent (~0.00203928 SOL) reclaimed to wallet")
+                        else:
+                            print(f"[sell_real] ℹ️ [Background] ATA status: {close_result}")
+                        return  # Success, exit
+                    
+                    # Step 4: If first attempt failed, wait 5 seconds and check balance
+                    print(f"[sell_real] ⚠️ [Background] First ATA close attempt failed: {close_result}")
+                    print(f"[sell_real] ⏳ [Background] Waiting 5 seconds before checking balance...")
+                    await asyncio.sleep(5.0)
+                    
+                    # Step 5: Check actual balance after failed close attempt
+                    print(f"[sell_real] 🔍 [Background] Checking actual token balance...")
+                    balance_after_failed_close, _ = await get_token_balance(keypair, token_address, token_decimals)
+                    DUST_THRESHOLD = 0.001  # Consider amounts < 0.001 as dust
+                    
+                    if balance_after_failed_close > DUST_THRESHOLD:
+                        # There's remaining balance (dust or more) - try to sell it
+                        print(f"[sell_real] ⚠️ [Background] Remaining balance detected: {balance_after_failed_close:.8f} tokens")
+                        
+                        # Wait 1 second before selling dust
+                        print(f"[sell_real] ⏳ [Background] Waiting 1 second before selling dust...")
+                        await asyncio.sleep(1.0)
+                        
+                        print(f"[sell_real] 🔄 [Background] Attempting to sell remaining balance...")
+                        try:
+                            # Try to sell the remaining balance
+                            dust_sell_result = await execute_sell(
+                                token_id=token_id,
+                                keypair=keypair,
+                                token_address=token_address,
+                                token_amount=balance_after_failed_close,
+                                token_decimals=token_decimals,
+                                rpc_endpoint=rpc_endpoint,
+                                sender_endpoint=sender_endpoint,
+                                simulate=False,
+                            )
+                            if dust_sell_result.get("success"):
+                                dust_signature = dust_sell_result.get("signature")
+                                dust_amount_usd = dust_sell_result.get("actual_amount_usd", 0.0)
+                                print(f"[sell_real] ✅ [Background] Remaining balance sold successfully: ${dust_amount_usd:.6f}, signature: {dust_signature}")
+                                
+                                # Wait for dust sale confirmation (5 seconds)
+                                if dust_signature:
+                                    print(f"[sell_real] ⏳ [Background] Waiting for dust sale confirmation: {dust_signature}")
+                                    dust_confirmed = await _wait_for_signature_confirmation(dust_signature, timeout_sec=30.0, poll_interval=0.5)
+                                    if dust_confirmed:
+                                        print(f"[sell_real] ⏳ [Background] Waiting 5 seconds after dust sale confirmation...")
+                                        await asyncio.sleep(5.0)
+                                
+                                # Step 6: Try to close ATA after selling dust (with retries)
+                                print(f"[sell_real] 🔄 [Background] Attempting to close ATA after selling remaining balance...")
+                                
+                                # First retry attempt
+                                close_success, close_result = await _close_ata_after_sell(keypair, token_address, rpc_endpoint)
+                                if close_success:
+                                    if isinstance(close_result, str) and len(close_result) > 50:  # Signature
+                                        print(f"[sell_real] ✅ [Background] ATA closed successfully: {close_result}")
+                                        print(f"[sell_real] 💰 [Background] Rent (~0.00203928 SOL) reclaimed to wallet")
+                                    else:
+                                        print(f"[sell_real] ℹ️ [Background] ATA status: {close_result}")
+                                    return  # Success
+                                
+                                # Second retry attempt (wait 3 seconds)
+                                print(f"[sell_real] ⚠️ [Background] First retry failed: {close_result}")
+                                print(f"[sell_real] ⏳ [Background] Waiting 3 seconds before second retry...")
+                                await asyncio.sleep(3.0)
+                                
+                                close_success, close_result = await _close_ata_after_sell(keypair, token_address, rpc_endpoint)
+                                if close_success:
+                                    if isinstance(close_result, str) and len(close_result) > 50:  # Signature
+                                        print(f"[sell_real] ✅ [Background] ATA closed successfully (second retry): {close_result}")
+                                        print(f"[sell_real] 💰 [Background] Rent (~0.00203928 SOL) reclaimed to wallet")
+                                    else:
+                                        print(f"[sell_real] ℹ️ [Background] ATA status: {close_result}")
+                                    return  # Success
+                                
+                                # Third retry attempt (wait 3 seconds)
+                                print(f"[sell_real] ⚠️ [Background] Second retry failed: {close_result}")
+                                print(f"[sell_real] ⏳ [Background] Waiting 3 seconds before third retry...")
+                                await asyncio.sleep(3.0)
+                                
+                                close_success, close_result = await _close_ata_after_sell(keypair, token_address, rpc_endpoint)
+                                if close_success:
+                                    if isinstance(close_result, str) and len(close_result) > 50:  # Signature
+                                        print(f"[sell_real] ✅ [Background] ATA closed successfully (third retry): {close_result}")
+                                        print(f"[sell_real] 💰 [Background] Rent (~0.00203928 SOL) reclaimed to wallet")
+                                    else:
+                                        print(f"[sell_real] ℹ️ [Background] ATA status: {close_result}")
+                                else:
+                                    print(f"[sell_real] ⚠️ [Background] All retry attempts failed. Final error: {close_result}")
+                            else:
+                                print(f"[sell_real] ⚠️ [Background] Failed to sell remaining balance: {dust_sell_result.get('message', 'Unknown error')}")
+                        except Exception as e:
+                            print(f"[sell_real] ⚠️ [Background] Error selling remaining balance: {e}")
+                    else:
+                        # No significant balance remaining - try to close ATA directly with retries
+                        print(f"[sell_real] ℹ️ [Background] No significant balance remaining ({balance_after_failed_close:.8f} tokens)")
+                        
+                        # First retry attempt
+                        close_success, close_result = await _close_ata_after_sell(keypair, token_address, rpc_endpoint)
+                        if close_success:
+                            if isinstance(close_result, str) and len(close_result) > 50:  # Signature
+                                print(f"[sell_real] ✅ [Background] ATA closed successfully: {close_result}")
+                                print(f"[sell_real] 💰 [Background] Rent (~0.00203928 SOL) reclaimed to wallet")
+                            else:
+                                print(f"[sell_real] ℹ️ [Background] ATA status: {close_result}")
+                            return  # Success
+                        
+                        # Second retry attempt (wait 3 seconds)
+                        print(f"[sell_real] ⚠️ [Background] First retry failed: {close_result}")
+                        print(f"[sell_real] ⏳ [Background] Waiting 3 seconds before second retry...")
+                        await asyncio.sleep(3.0)
+                        
+                        close_success, close_result = await _close_ata_after_sell(keypair, token_address, rpc_endpoint)
+                        if close_success:
+                            if isinstance(close_result, str) and len(close_result) > 50:  # Signature
+                                print(f"[sell_real] ✅ [Background] ATA closed successfully (second retry): {close_result}")
+                                print(f"[sell_real] 💰 [Background] Rent (~0.00203928 SOL) reclaimed to wallet")
+                            else:
+                                print(f"[sell_real] ℹ️ [Background] ATA status: {close_result}")
+                            return  # Success
+                        
+                        # Third retry attempt (wait 3 seconds)
+                        print(f"[sell_real] ⚠️ [Background] Second retry failed: {close_result}")
+                        print(f"[sell_real] ⏳ [Background] Waiting 3 seconds before third retry...")
+                        await asyncio.sleep(3.0)
+                        
+                        close_success, close_result = await _close_ata_after_sell(keypair, token_address, rpc_endpoint)
+                        if close_success:
+                            if isinstance(close_result, str) and len(close_result) > 50:  # Signature
+                                print(f"[sell_real] ✅ [Background] ATA closed successfully (third retry): {close_result}")
+                                print(f"[sell_real] 💰 [Background] Rent (~0.00203928 SOL) reclaimed to wallet")
+                            else:
+                                print(f"[sell_real] ℹ️ [Background] ATA status: {close_result}")
+                        else:
+                            print(f"[sell_real] ⚠️ [Background] All retry attempts failed. Final error: {close_result}")
+                except Exception as e:
+                    print(f"[sell_real] ⚠️ [Background] Error in ATA close background task: {e}")
+            
+            # Start background task (non-blocking)
+            asyncio.create_task(_close_ata_background())
         if expected_usd_received is not None:
             print(f"  - Expected gross amount: ${expected_usd_received:.2f}")
         if fee_sol_val is not None:
@@ -1405,6 +1593,7 @@ async def sell_real(token_id: int, *, source: str = 'auto_sell', simulate: bool 
         except Exception as e:
             print(f"[sell_real] ⚠️ Failed to clear wallet_id for token {token_id}: {e}")
         
+        
         # 7. Update journal with exit details (REAL trading data)
         # Get current iteration = count of records in token_metrics_seconds with usd_price > 0 (non-zero)
         # Iteration = real seconds of token life with valid price (each token has its own count)
@@ -1412,8 +1601,8 @@ async def sell_real(token_id: int, *, source: str = 'auto_sell', simulate: bool 
         # This is the REAL exit iteration, not hardcoded 1!
         exit_iteration = await get_token_iterations_count(conn, token_id)
         
-        # Use actual amount sold (may be less than entry_token_amount if retry was needed)
-        actual_amount_sold = token_amount  # This is the amount that was successfully sold
+        # actual_amount_sold is already calculated above based on balance change
+        # This ensures we record the REAL amount sold, not just what we tried to sell
         exit_slippage_bps = sell_result.get("slippage_bps")
         exit_slippage_pct = sell_result.get("slippage_pct")
         exit_price_impact_pct = sell_result.get("price_impact_pct")
@@ -1896,6 +2085,11 @@ async def buy_real(token_id: int, *, source: str = 'auto_buy', simulate: bool = 
         # This is the REAL entry iteration, not hardcoded 1!
         entry_iteration = await get_token_iterations_count(conn, token_id)
         
+        # Get SOL price at entry time (for SOL-based profit calculation)
+        entry_sol_price = get_current_sol_price()
+        if entry_sol_price <= 0:
+            entry_sol_price = float(getattr(config, 'SOL_PRICE_FALLBACK', 193.0))
+        
         # Log to history
         history_id = None
         try:
@@ -1905,9 +2099,9 @@ async def buy_real(token_id: int, *, source: str = 'auto_buy', simulate: bool = 
                     wallet_id, token_id,
                     entry_amount_usd, entry_token_amount, entry_price_usd, entry_iteration,
                     entry_slippage_bps, entry_slippage_pct, entry_price_impact_pct, entry_transaction_fee_sol, entry_transaction_fee_usd,
-                    entry_expected_amount_usd, entry_actual_amount_usd, entry_signature,
+                    entry_expected_amount_usd, entry_actual_amount_usd, entry_signature, entry_sol_price,
                     outcome, reason, created_at, updated_at
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'','manual',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'','manual',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
                 RETURNING id
                 """,
                 key_id, token_id,
@@ -1915,13 +2109,14 @@ async def buy_real(token_id: int, *, source: str = 'auto_buy', simulate: bool = 
                 buy_result.get("slippage_bps"), buy_result.get("slippage_pct"), buy_result.get("price_impact_pct"),
                 buy_result.get("transaction_fee_sol"), buy_result.get("transaction_fee_usd"),
                 buy_result.get("expected_amount_usd"), buy_result.get("actual_amount_usd"),
-                buy_result.get("signature")
+                buy_result.get("signature"), entry_sol_price
             )
             print(f"[buy_real] 📝 Recorded in wallet_history{sim_status}:")
             print(f"  - wallet_id={key_id}, token_id={token_id}")
             print(f"  - entry_amount_usd=${entry_amount_usd:.2f}")
             print(f"  - entry_token_amount={buy_result.get('amount_tokens'):.8f}")
             print(f"  - entry_price_usd=${buy_result.get('price_usd'):.8f}")
+            print(f"  - entry_sol_price=${entry_sol_price:.2f}")
             print(f"  - entry_iteration={entry_iteration}")
             print(f"  - Wallet is now bound to token (tokens.wallet_id={key_id})")
             print(f"  - Waiting for sell to free wallet...")
@@ -2021,6 +2216,81 @@ async def _fetch_helius_transaction(
             else:
                 return None
     return None
+
+
+async def _close_ata_after_sell(
+    keypair: Keypair,
+    token_address: str,
+    rpc_endpoint: str,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Close ATA after sell to reclaim Rent.
+    Returns: (success, error_message or signature)
+    """
+    TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+    ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+    
+    owner = keypair.pubkey()
+    mint = Pubkey.from_string(token_address)
+    
+    # Derive ATA address
+    seeds = [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)]
+    ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
+    
+    try:
+        async with AsyncClient(rpc_endpoint, commitment="confirmed") as client:
+            # Check if ATA exists
+            account_info = await client.get_account_info(ata)
+            if account_info.value is None:
+                return True, "ATA does not exist (already closed)"
+            
+            # Check balance
+            balance_resp = await client.get_token_account_balance(ata)
+            balance = balance_resp.value
+            ui_amount = float(balance.ui_amount) if balance and balance.ui_amount is not None else 0.0
+            
+            if ui_amount > 0.000001:  # Has tokens, cannot close
+                return False, f"ATA still has {ui_amount:.8f} tokens"
+            
+            # Build close account instruction
+            instruction = Instruction(
+                program_id=TOKEN_PROGRAM_ID,
+                data=bytes([9]),  # SPL Token close-account discriminator
+                accounts=[
+                    AccountMeta(pubkey=ata, is_signer=False, is_writable=True),
+                    AccountMeta(pubkey=owner, is_signer=False, is_writable=True),
+                    AccountMeta(pubkey=owner, is_signer=True, is_writable=False),
+                ],
+            )
+            
+            # Build transaction
+            message = Message([instruction], owner)
+            latest_blockhash_resp = await client.get_latest_blockhash()
+            latest_blockhash = latest_blockhash_resp.value.blockhash
+            tx = Transaction(
+                [keypair],
+                message,
+                latest_blockhash if isinstance(latest_blockhash, Hash) else Hash.from_string(str(latest_blockhash))
+            )
+            
+            # Send transaction
+            opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=3)
+            response = await client.send_raw_transaction(bytes(tx), opts=opts)
+            signature = response.value
+            
+            if signature:
+                lamports = account_info.value.lamports
+                refund_sol = lamports / 1_000_000_000
+                return True, signature
+            else:
+                return False, "Transaction failed"
+                
+    except Exception as e:
+        error_msg = str(e)
+        # Check if error is "account already closed" or similar
+        if "does not exist" in error_msg.lower() or "not found" in error_msg.lower():
+            return True, "ATA already closed"
+        return False, error_msg
 
 
 def _extract_token_amount_from_tx(tx_data: Dict[str, Any], wallet_address: str, token_address: str, token_decimals: int) -> Optional[float]:

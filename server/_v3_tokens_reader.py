@@ -160,6 +160,8 @@ class TokensReaderV3:
                             token_id,
                             entry_token_amount,
                             entry_price_usd,
+                            entry_amount_usd,
+                            entry_sol_price,
                             entry_iteration
                         FROM wallet_history
                         WHERE exit_iteration IS NULL
@@ -279,6 +281,8 @@ class TokensReaderV3:
                         COALESCE(mc.iteration_count, 0) AS iteration_count,
                         op.entry_token_amount,
                         op.entry_price_usd,
+                        op.entry_amount_usd,
+                        op.entry_sol_price,
                         op.entry_iteration,
                         cp.exit_token_amount,
                         cp.exit_price_usd,
@@ -450,7 +454,34 @@ class TokensReaderV3:
                     # Entry data from wallet_history (open position)
                     entry_token_amount = float(row['entry_token_amount']) if row.get('entry_token_amount') else None
                     entry_price_usd = float(row['entry_price_usd']) if row.get('entry_price_usd') else None
+                    entry_amount_usd = float(row['entry_amount_usd']) if row.get('entry_amount_usd') else None
+                    entry_sol_price = float(row['entry_sol_price']) if row.get('entry_sol_price') else None
                     entry_iteration = row.get('entry_iteration')
+                    
+                    # Calculate current portfolio value and profit in SOL (for SOL-based profit calculation)
+                    cur_income_price_sol = None
+                    profit_pct_sol = None
+                    if entry_token_amount and entry_price_usd and entry_amount_usd and entry_sol_price and entry_sol_price > 0:
+                        from _v2_sol_price import get_current_sol_price
+                        current_sol_price = get_current_sol_price()
+                        if current_sol_price <= 0:
+                            current_sol_price = float(getattr(config, 'SOL_PRICE_FALLBACK', 193.0))
+                        
+                        # Calculate current portfolio value in USD (if not provided, calculate from entry_token_amount * current_price)
+                        current_price_usd = float(row.get('usd_price') or 0) if row.get('usd_price') else None
+                        if not cur_income_price_usd and entry_token_amount and current_price_usd and current_price_usd > 0:
+                            cur_income_price_usd = entry_token_amount * current_price_usd
+                        
+                        # Calculate current portfolio value in SOL
+                        if cur_income_price_usd and current_sol_price > 0:
+                            cur_income_price_sol = cur_income_price_usd / current_sol_price
+                        
+                        # Calculate entry amount in SOL
+                        entry_amount_sol = entry_amount_usd / entry_sol_price if entry_sol_price > 0 else None
+                        
+                        # Calculate profit percentage in SOL
+                        if cur_income_price_sol and entry_amount_sol and entry_amount_sol > 0:
+                            profit_pct_sol = ((cur_income_price_sol - entry_amount_sol) / entry_amount_sol) * 100
                     
                     # PREVIEW FORECAST: If no real position but plan_sell_* exists, calculate preview entry data
                     # This allows frontend to show "Bought" section with preview entry at AI_PREVIEW_ENTRY_SEC
@@ -603,6 +634,9 @@ class TokensReaderV3:
                         "plan_sell_iteration": plan_sell_iteration,
                         "plan_sell_price_usd": plan_sell_price_usd,
                         "cur_income_price_usd": cur_income_price_usd,
+                        "cur_income_price_sol": cur_income_price_sol,  # Current portfolio value in SOL
+                        "profit_pct_sol": profit_pct_sol,  # Profit percentage in SOL
+                        "entry_sol_price": entry_sol_price,  # SOL price at entry
                         "has_real_trading": has_real_trading,  # NULL, TRUE, or FALSE
                         "swap_count": swap_count,
                         "transfer_count": transfer_count,
@@ -633,6 +667,9 @@ class TokensReaderV3:
                 # if self.debug:
                 #     print(f"[TokensReader] Formatted {len(formatted_tokens)} tokens, total_count={total_count}")
                 
+                # Get TARGET_RETURN from config
+                target_return = float(getattr(config, 'TARGET_RETURN', 0.2))
+                
                 result = {
                     "success": True,
                     "tokens": formatted_tokens,
@@ -641,7 +678,8 @@ class TokensReaderV3:
                     "limit": limit,
                     "offset": offset,
                     "has_more": (offset + limit) < total_count,
-                    "scan_time": datetime.now().isoformat()
+                    "scan_time": datetime.now().isoformat(),
+                    "target_return": target_return  # TARGET_RETURN from config
                 }
                 
                 # Update counts for next time

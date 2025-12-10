@@ -398,6 +398,14 @@ async def init_database():
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_wh_token ON wallet_history(token_id)")
         except Exception:
             pass
+        
+        # Add entry_sol_price column if it doesn't exist (for SOL-based profit calculation)
+        try:
+            await conn.execute(
+                "ALTER TABLE wallet_history ADD COLUMN IF NOT EXISTS entry_sol_price NUMERIC(20,8)"
+            )
+        except Exception:
+            pass
 
         # Trade attempts log (manual + auto buy/sell attempts with reasons)
         try:

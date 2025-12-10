@@ -80,6 +80,9 @@ type TokenState = {
   plan_sell_iteration?: number | null;  // Запланована ітерація продажу
   plan_sell_price_usd?: number | null;  // Запланована ціна продажу
   cur_income_price_usd?: number | null;  // Поточна вартість портфеля (USD)
+  cur_income_price_sol?: number | null;  // Поточна вартість портфеля (SOL)
+  profit_pct_sol?: number | null;  // Відсоток приросту портфеля в SOL
+  entry_sol_price?: number | null;  // Курс SOL при покупці
   totalTx: number;
   buyTx: number;
   sellTx: number;
@@ -108,6 +111,7 @@ export default function Home() {
   const [tokenCount, setTokenCount] = useState(0); // Tokens with valid pairs and history_ready = false
   const [totalTokenCount, setTotalTokenCount] = useState(0); // Total tokens in database
   const [historyMode, setHistoryMode] = useState(false);
+  const [targetReturn, setTargetReturn] = useState<number>(0.2); // TARGET_RETURN from backend config, default 0.2 (20%)
   const wsRef = useRef<WebSocket | null>(null);
   const wsTokensRef = useRef<WebSocket | null>(null);
   const wsChartRef = useRef<WebSocket | null>(null);
@@ -375,6 +379,7 @@ export default function Home() {
             tokens?: RawTokenMessage[];
             total_count?: number;
             total_found?: number;
+            target_return?: number;  // TARGET_RETURN from backend config
           };
           // console.log("📊 Parsed token data:", tokenData);
           
@@ -386,6 +391,10 @@ export default function Home() {
           }
           if (tokenData.total_count !== undefined) {
             setTotalTokenCount(tokenData.total_count);
+          }
+          // Update target_return from backend config
+          if (tokenData.target_return !== undefined && typeof tokenData.target_return === 'number') {
+            setTargetReturn(tokenData.target_return);
           }
           
           if (tokenData.success && tokenData.tokens) {
@@ -429,7 +438,10 @@ export default function Home() {
               const entryIterNum = toNumber(token.entry_iteration);
               const exitIterNum = toNumber(token.exit_iteration);
               const curIncomeNum = toNumber(token.cur_income_price_usd);
+              const curIncomeSolNum = toNumber(token.cur_income_price_sol);
               const profitNum = toNumber(token.profit_usd);
+              const profitPctSolNum = toNumber(token.profit_pct_sol);
+              const entrySolPriceNum = toNumber(token.entry_sol_price);
               const entryAmountNum = toNumber(token.entry_token_amount);
               const exitAmountNum = toNumber(token.exit_token_amount);
               const entryPriceNum = toNumber(token.entry_price_usd);
@@ -501,6 +513,9 @@ export default function Home() {
                   return prev?.exit_iteration ?? null;
                 })(),
                 cur_income_price_usd: Number.isFinite(curIncomeNum) ? curIncomeNum : prev?.cur_income_price_usd ?? null,
+                cur_income_price_sol: Number.isFinite(curIncomeSolNum) ? curIncomeSolNum : prev?.cur_income_price_sol ?? null,
+                profit_pct_sol: Number.isFinite(profitPctSolNum) ? profitPctSolNum : prev?.profit_pct_sol ?? null,
+                entry_sol_price: Number.isFinite(entrySolPriceNum) ? entrySolPriceNum : prev?.entry_sol_price ?? null,
                 profit_usd: Number.isFinite(profitNum) ? profitNum : prev?.profit_usd ?? null,
                 entry_token_amount: Number.isFinite(entryAmountNum) ? entryAmountNum : prev?.entry_token_amount ?? null,
                 exit_token_amount: Number.isFinite(exitAmountNum) ? exitAmountNum : prev?.exit_token_amount ?? null,
@@ -904,7 +919,7 @@ export default function Home() {
         }}></div>
 
         {/* Right Column - Token List */}
-        <TokenList tokens={sortedTokens} showForecast={aiEnabled} />
+        <TokenList tokens={sortedTokens} showForecast={aiEnabled} targetReturn={targetReturn} />
       </div>
     </div>
   );

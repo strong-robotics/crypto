@@ -1172,7 +1172,8 @@ class JupiterAnalyzerV3:
                         SELECT 
                             wh.entry_token_amount,
                             wh.entry_amount_usd,
-                            wh.entry_price_usd
+                            wh.entry_price_usd,
+                            wh.entry_sol_price
                         FROM wallet_history wh
                         WHERE wh.token_id=$1 AND wh.exit_iteration IS NULL
                         ORDER BY wh.id DESC
@@ -1184,8 +1185,9 @@ class JupiterAnalyzerV3:
                     if position_row:
                         entry_token_amount = float(position_row.get("entry_token_amount") or 0.0)
                         entry_amount_usd = float(position_row.get("entry_amount_usd") or 0.0)
+                        entry_sol_price = float(position_row.get("entry_sol_price") or 0.0)
                         
-                        if entry_token_amount > 0 and entry_amount_usd > 0:
+                        if entry_token_amount > 0 and entry_amount_usd > 0 and entry_sol_price > 0:
                             # Get current price
                             price_row = await conn.fetchrow(
                                 """
@@ -1200,21 +1202,30 @@ class JupiterAnalyzerV3:
                             current_price = float(price_row["usd_price"] or 0) if price_row and price_row.get("usd_price") else None
                             
                             if current_price and current_price > 0:
-                                # Calculate current portfolio value (theoretical, before fees)
-                                current_portfolio_value = entry_token_amount * current_price
+                                # Get current SOL price (updated every second by SolPriceMonitor)
+                                from _v2_sol_price import get_current_sol_price
+                                current_sol_price = get_current_sol_price()
+                                if current_sol_price <= 0:
+                                    current_sol_price = float(getattr(config, 'SOL_PRICE_FALLBACK', 193.0))
+                                
+                                # Calculate how much SOL we spent at entry
+                                entry_amount_sol = entry_amount_usd / entry_sol_price
+                                
+                                # Calculate current portfolio value in SOL (theoretical, before fees)
+                                # current_value_sol = (entry_token_amount * current_price) / current_sol_price
+                                current_value_sol = (entry_token_amount * current_price) / current_sol_price if current_sol_price > 0 else 0
                                 
                                 # Get TARGET_RETURN from config
-                                target_return = float(getattr(config, 'TARGET_RETURN', 0.13))
+                                target_return = float(getattr(config, 'TARGET_RETURN', 0.035))
                                 
-                                # Calculate target value: entry + target return (e.g., 20%)
+                                # Calculate target value in SOL: entry_amount_sol * (1 + target_return)
+                                # This ensures we only sell when portfolio grows by target_return% in SOL terms
                                 # NOTE: Fees (slippage, transaction fees) will be deducted from the sale proceeds
                                 # This means the actual profit after fees will be less than target_return
-                                # Example: If token grows 20% to $4.80, after 5% slippage + fees we get ~$4.56 (14% real profit)
-                                # This is the intended behavior: sell when token grows by target_return%, fees are deducted from proceeds
-                                target_value = entry_amount_usd * (1.0 + target_return)
+                                target_value_sol = entry_amount_sol * (1.0 + target_return)
                                 
-                                # Check if current value >= target value (entry + profit)
-                                if current_portfolio_value >= target_value:
+                                # Check if current value in SOL >= target value in SOL
+                                if current_value_sol >= target_value_sol:
                                     # Execute real sell in background task (non-blocking)
                                     # This prevents blocking the analyzer loop during retry logic (up to 30 seconds)
                                     async def _auto_sell_task():
@@ -1223,8 +1234,8 @@ class JupiterAnalyzerV3:
                                             if sell_result.get("success"):
                                                 if self.debug:
                                                     print(
-                                                        f"[Analyzer] ✅ Auto-sold token {token_id}: current_value=${current_portfolio_value:.6f} >= "
-                                                        f"target=${target_value:.6f} (entry=${entry_amount_usd:.6f} + {target_return*100:.1f}%, fees will be deducted from sale proceeds)"
+                                                        f"[Analyzer] ✅ Auto-sold token {token_id}: current_value_sol={current_value_sol:.8f} SOL >= "
+                                                        f"target_sol={target_value_sol:.8f} SOL (entry_sol={entry_amount_sol:.8f} SOL + {target_return*100:.1f}%, fees will be deducted from sale proceeds)"
                                                     )
                                             else:
                                                 if self.debug:

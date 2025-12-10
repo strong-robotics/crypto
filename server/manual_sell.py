@@ -22,7 +22,13 @@ from typing import Optional
 
 import aiohttp
 from solders.keypair import Keypair
-from solders.transaction import VersionedTransaction
+from solders.transaction import VersionedTransaction, Transaction
+from solders.instruction import AccountMeta, Instruction
+from solders.pubkey import Pubkey
+from solders.message import Message
+from solders.hash import Hash
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import TxOpts
 
 from config import config
 from _v2_sol_price import get_current_sol_price
@@ -249,6 +255,81 @@ async def _send_transaction(session: aiohttp.ClientSession, swap_payload: dict, 
         return signature
 
 
+async def _close_ata_after_sell(
+    keypair: Keypair,
+    token_address: str,
+    rpc_endpoint: str,
+) -> tuple[bool, Optional[str]]:
+    """
+    Close ATA after sell to reclaim Rent.
+    Returns: (success, error_message or signature)
+    """
+    TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+    ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+    
+    owner = keypair.pubkey()
+    mint = Pubkey.from_string(token_address)
+    
+    # Derive ATA address
+    seeds = [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)]
+    ata, _ = Pubkey.find_program_address(seeds, ASSOCIATED_TOKEN_PROGRAM_ID)
+    
+    try:
+        async with AsyncClient(rpc_endpoint, commitment="confirmed") as client:
+            # Check if ATA exists
+            account_info = await client.get_account_info(ata)
+            if account_info.value is None:
+                return True, "ATA does not exist (already closed)"
+            
+            # Check balance
+            balance_resp = await client.get_token_account_balance(ata)
+            balance = balance_resp.value
+            ui_amount = float(balance.ui_amount) if balance and balance.ui_amount is not None else 0.0
+            
+            if ui_amount > 0.000001:  # Has tokens, cannot close
+                return False, f"ATA still has {ui_amount:.8f} tokens"
+            
+            # Build close account instruction
+            instruction = Instruction(
+                program_id=TOKEN_PROGRAM_ID,
+                data=bytes([9]),  # SPL Token close-account discriminator
+                accounts=[
+                    AccountMeta(pubkey=ata, is_signer=False, is_writable=True),
+                    AccountMeta(pubkey=owner, is_signer=False, is_writable=True),
+                    AccountMeta(pubkey=owner, is_signer=True, is_writable=False),
+                ],
+            )
+            
+            # Build transaction
+            message = Message([instruction], owner)
+            latest_blockhash_resp = await client.get_latest_blockhash()
+            latest_blockhash = latest_blockhash_resp.value.blockhash
+            tx = Transaction(
+                [keypair],
+                message,
+                latest_blockhash if isinstance(latest_blockhash, Hash) else Hash.from_string(str(latest_blockhash))
+            )
+            
+            # Send transaction
+            opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed", max_retries=3)
+            response = await client.send_raw_transaction(bytes(tx), opts=opts)
+            signature = response.value
+            
+            if signature:
+                lamports = account_info.value.lamports
+                refund_sol = lamports / 1_000_000_000
+                return True, signature
+            else:
+                return False, "Transaction failed"
+                
+    except Exception as e:
+        error_msg = str(e)
+        # Check if error is "account already closed" or similar
+        if "does not exist" in error_msg.lower() or "not found" in error_msg.lower():
+            return True, "ATA already closed"
+        return False, error_msg
+
+
 async def _wait_for_signature_confirmation(signature: str, timeout_sec: float = 30.0, poll_interval: float = 0.5) -> bool:
     rpc = _resolve_rpc_endpoint()
     payload = {
@@ -319,6 +400,34 @@ async def manual_sell(args):
                     print("[ManualSell] ⚠️ Transaction confirmation timed out; skipping Helius reconciliation")
                     return
                 await _report_real_sale(signature, str(keypair.pubkey()))
+                
+                # Try to close ATA immediately after sell (to reclaim Rent)
+                print("[ManualSell] 🔄 Attempting to close ATA to reclaim Rent...")
+                rpc_endpoint = _resolve_rpc_endpoint()
+                close_success, close_result = await _close_ata_after_sell(keypair, args.token_address, rpc_endpoint)
+                
+                if close_success:
+                    if isinstance(close_result, str) and len(close_result) > 50:  # Signature
+                        print(f"[ManualSell] ✅ ATA closed successfully: {close_result}")
+                        print(f"[ManualSell] 💰 Rent (~0.00203928 SOL) reclaimed to wallet")
+                    else:
+                        print(f"[ManualSell] ℹ️ ATA status: {close_result}")
+                else:
+                    # Close failed - check if there's dust remaining
+                    print(f"[ManualSell] ⚠️ Failed to close ATA: {close_result}")
+                    print(f"[ManualSell] 🔍 Checking for remaining dust...")
+                    
+                    # Re-check balance
+                    balance_after, balance_after_raw = await _get_token_balance(keypair, args.token_address, decimals)
+                    DUST_THRESHOLD = 0.001  # Consider amounts < 0.001 as dust
+                    
+                    if balance_after > DUST_THRESHOLD:
+                        print(f"[ManualSell] ⚠️ Remaining balance: {balance_after:.8f} tokens (dust)")
+                        print(f"[ManualSell] 💡 You can manually sell dust and close ATA later")
+                        print(f"[ManualSell]    python3 server/manual_sell.py --key-id {args.key_id} --token-address {args.token_address} --amount {balance_after:.8f} --decimals {decimals}")
+                    else:
+                        print(f"[ManualSell] ℹ️ No significant dust remaining ({balance_after:.8f} tokens)")
+                
                 return
             except Exception as exc:
                 print(f"[ManualSell] ⚠️ Attempt with slippage {slippage_bps}bps failed: {exc}")

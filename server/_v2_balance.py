@@ -140,17 +140,34 @@ class BalanceV1:
                 print(f"[_wallets_refresh] Warning: SOL price is {sol_price}, using fallback")
                 sol_price = float(getattr(config, 'SOL_PRICE_FALLBACK', 193.0))
             
-            for w in keys_wallets:
+            # Step 1: Get all SOL balances in parallel (RPC calls)
+            semaphore = asyncio.Semaphore(10)  # Max 10 concurrent RPC calls
+            
+            async def get_wallet_balance(w):
+                """Get SOL balance for wallet - runs in parallel"""
                 wid = int(w.get('id'))
                 name = w.get('name') or f"Wallet {wid}"
                 address = w.get('address', '')
                 
                 if not address:
-                    print(f"[_wallets_refresh] Warning: No address for wallet {wid}")
+                    return None, wid, name
+                
+                async with semaphore:
+                    sol_balance = await self._get_sol_balance(address)
+                    return sol_balance, wid, name
+            
+            # Get all balances in parallel (RPC calls)
+            balance_tasks = [get_wallet_balance(w) for w in keys_wallets]
+            balance_results = await asyncio.gather(*balance_tasks, return_exceptions=True)
+            
+            # Step 2: Update database sequentially (to avoid connection conflicts)
+            for result in balance_results:
+                if isinstance(result, Exception):
                     continue
                 
-                # Get real SOL balance from RPC
-                sol_balance = await self._get_sol_balance(address)
+                sol_balance, wid, name = result
+                if wid is None:
+                    continue
                 
                 try:
                     existing = await conn.fetchrow("SELECT id, cash_usd FROM wallets WHERE id=$1", wid)

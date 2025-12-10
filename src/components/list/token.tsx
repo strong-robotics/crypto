@@ -37,15 +37,19 @@ interface TokenListProps {
     plan_sell_iteration?: number | null;  // Запланована ітерація продажу
     plan_sell_price_usd?: number | null;  // Запланована ціна продажу
     cur_income_price_usd?: number | null;  // Поточна вартість портфеля (USD)
+    cur_income_price_sol?: number | null;  // Поточна вартість портфеля (SOL)
+    profit_pct_sol?: number | null;  // Відсоток приросту портфеля в SOL
+    entry_sol_price?: number | null;  // Курс SOL при покупці
     pattern_segments?: string[];
     pattern_segment_decision?: string | null;
     has_real_trading?: boolean | null;  // NULL = not checked, TRUE = has SWAP, FALSE = transfer only
     medianAmountUsd?: number | null;
   }>;
   showForecast?: boolean;
+  targetReturn?: number;  // TARGET_RETURN from backend config
 }
 
-export function TokenList({ tokens, showForecast = false }: TokenListProps) {
+export function TokenList({ tokens, showForecast = false, targetReturn = 0.2 }: TokenListProps) {
 
   return (
     <div style={{
@@ -98,8 +102,12 @@ export function TokenList({ tokens, showForecast = false }: TokenListProps) {
           plan_sell_iteration={token.plan_sell_iteration}
           plan_sell_price_usd={token.plan_sell_price_usd}
           cur_income_price_usd={token.cur_income_price_usd}
+          cur_income_price_sol={token.cur_income_price_sol}
+          profit_pct_sol={token.profit_pct_sol}
+          entry_sol_price={token.entry_sol_price}
           has_real_trading={token.has_real_trading ?? null}
           medianAmountUsd={token.medianAmountUsd ?? null}
+          targetReturn={targetReturn}
         />
       ))}
     </div>

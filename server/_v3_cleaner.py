@@ -187,6 +187,32 @@ async def _find_no_pair_tokens(conn, min_iterations: int, limit: int) -> List[in
     return [int(r["id"]) for r in rows]
 
 
+async def _find_no_median_tokens(conn, min_iterations: int, limit: int) -> List[int]:
+    """Catch tokens с достаточным числом итераций, но без медианных объёмов."""
+    if limit <= 0 or min_iterations <= 0:
+        return []
+    rows = await conn.fetch(
+        """
+        WITH metric_counts AS (
+            SELECT token_id, COUNT(*) AS cnt
+            FROM token_metrics_seconds
+            GROUP BY token_id
+        )
+        SELECT t.id
+        FROM tokens t
+        JOIN metric_counts mc ON mc.token_id = t.id
+        WHERE t.median_amount_usd IS NULL
+          AND (t.wallet_id IS NULL OR t.wallet_id = 0)
+          AND mc.cnt >= $2
+        ORDER BY mc.cnt DESC, t.id ASC
+        LIMIT $1
+        """,
+        limit,
+        min_iterations,
+    )
+    return [int(r["id"]) for r in rows]
+
+
 async def _count_no_pair_tokens(conn) -> int:
     row = await conn.fetchval(
         """
@@ -205,6 +231,26 @@ async def _count_no_swap_tokens(conn) -> int:
         FROM tokens
         WHERE no_swap_after_second_corridor = TRUE
         """
+    )
+    return int(row or 0)
+
+
+async def _count_no_median_tokens(conn, min_iterations: int) -> int:
+    row = await conn.fetchval(
+        """
+        WITH metric_counts AS (
+            SELECT token_id, COUNT(*) AS cnt
+            FROM token_metrics_seconds
+            GROUP BY token_id
+        )
+        SELECT COUNT(*)
+        FROM tokens t
+        JOIN metric_counts mc ON mc.token_id = t.id
+        WHERE t.median_amount_usd IS NULL
+          AND (t.wallet_id IS NULL OR t.wallet_id = 0)
+          AND mc.cnt >= $1
+        """,
+        min_iterations,
     )
     return int(row or 0)
 
@@ -249,6 +295,35 @@ async def _drain_no_pair_tokens(conn, min_iterations: int, batch_size: int) -> i
         #     f"[Cleaner] no_pair moved={total} tokens (start={initial_count}, remaining={remaining})"
         # )
     return total
+
+
+async def _drain_no_median_tokens(conn, min_iterations: int, batch_size: int) -> int:
+    """Move tokens без медианных объёмов в bad tables."""
+    if batch_size <= 0 or min_iterations <= 0:
+        return 0
+    total = 0
+    initial_count = await _count_no_median_tokens(conn, min_iterations)
+    while True:
+        ids = await _find_no_median_tokens(conn, min_iterations, batch_size)
+        if not ids:
+            break
+        removed = await _move_to_bad_tables(conn, ids, "no_median")
+        total += removed
+        if len(ids) < batch_size:
+            break
+    # if total > 0:
+    #     remaining = await _count_no_median_tokens(conn, min_iterations)
+        # print(
+        #     f"[Cleaner] no_median moved={total} tokens (start={initial_count}, remaining={remaining})"
+        # )
+    return total
+
+
+async def purge_tokens_without_median(min_iterations: int, batch_size: int) -> int:
+    """Legacy stub (not used)."""
+    return 0
+
+
 
 
 async def _find_no_price_tokens(conn, limit: int) -> List[int]:
@@ -502,16 +577,18 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
                     print(f"[Cleaner] removed no_swap={removed}")
                     bad_removed["no_swap"] = bad_removed.get("no_swap", 0) + removed
 
-            if dry_run:
-                no_pair_ids = await _find_no_pair_tokens(conn, older_than_sec, remaining)
-                if no_pair_ids:
-                    ids.extend(no_pair_ids)
-                    remaining = max(0, remaining - len(no_pair_ids))
-            else:
-                removed = await _drain_no_pair_tokens(conn, older_than_sec, limit)
-                if removed:
-                    # print(f"[Cleaner] removed no_pair={removed}")
-                    bad_removed["no_pair"] = bad_removed.get("no_pair", 0) + removed
+            # Purge tokens that never received median amounts
+            median_iter_threshold = int(getattr(config, "MEDIAN_MIN_ITERATIONS", 0) or 0)
+            if median_iter_threshold > 0:
+                if dry_run:
+                    no_median_ids = await _find_no_median_tokens(conn, median_iter_threshold, remaining)
+                    if no_median_ids:
+                        ids.extend(no_median_ids)
+                        remaining = max(0, remaining - len(no_median_ids))
+                else:
+                    removed = await _drain_no_median_tokens(conn, median_iter_threshold, limit)
+                    if removed:
+                        bad_removed["no_median"] = bad_removed.get("no_median", 0) + removed
 
             zero_tail_candidates = await _find_flagged_tokens(conn, "zero_tail", remaining)
             zero_tail_candidates = await _filter_tokens_without_wallet(conn, zero_tail_candidates)
@@ -521,10 +598,10 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
                 else:
                     archived, removed = await _process_flagged_tokens(conn, zero_tail_candidates, "zero_tail", archive_threshold)
                     if archived:
-                        print(f"[Cleaner] archived zero_tail={archived}")
+                        # print(f"[Cleaner] archived zero_tail={archived}")
                         archived_summary["zero_tail"] = archived_summary.get("zero_tail", 0) + archived
                     if removed:
-                        print(f"[Cleaner] removed zero_tail={removed}")
+                        # print(f"[Cleaner] removed zero_tail={removed}")
                         bad_removed["zero_tail"] = bad_removed.get("zero_tail", 0) + removed
                 remaining = max(0, remaining - len(zero_tail_candidates))
 
@@ -536,10 +613,10 @@ async def run_cleanup(dry_run: bool = True, older_than_sec: int = 15, limit: int
                 else:
                     archived, removed = await _process_flagged_tokens(conn, frozen_candidates, "frozen_price", archive_threshold)
                     if archived:
-                        print(f"[Cleaner] archived frozen_price={archived}")
+                        # print(f"[Cleaner] archived frozen_price={archived}")
                         archived_summary["frozen_price"] = archived_summary.get("frozen_price", 0) + archived
                     if removed:
-                        print(f"[Cleaner] removed frozen_price={removed}")
+                        # print(f"[Cleaner] removed frozen_price={removed}")
                         bad_removed["frozen_price"] = bad_removed.get("frozen_price", 0) + removed
                 remaining = max(0, remaining - len(frozen_candidates))
 

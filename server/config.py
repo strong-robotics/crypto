@@ -207,8 +207,8 @@ class Config:
     # ============================================================================
     # TRADING / AI CONSTANTS (centralized)
     # ============================================================================
-    # Target profit for simulated exits (e.g., +20%)
-    TARGET_RETURN = 0.2
+    # Target profit for simulated exits (e.g., +3.5% minimum for $2 entry to cover fees and slippage)
+    TARGET_RETURN = 0.035
 
     # JUNO (ETA) parameters
     # Comma-separated bins in seconds, e.g. "30,40,60,90,120,180,240"
@@ -246,6 +246,7 @@ class Config:
     ZERO_TAIL_CONSEC_SEC = 120  # нужно 120 последовательных пустых итераций, чтобы признать токен «мертвым»
     ZERO_TAIL_MIN_FILL_RATIO = 0.40  # если фактических секунд < 40% от реального возраста → считаем график мертвым
     ZERO_TAIL_MIN_FILL_LIFE_SEC = 180  # проверять fill ratio только после 3 минут жизни токена
+    MEDIAN_MIN_ITERATIONS = 50  # purge tokens that never get median trades after N iterations
     # Do NOT trigger zero-liquidity guard until token прожил минимум столько секунд.
     CLEANER_LOW_HOLDER_ITER_THRESHOLD = 500  # минимальное количество итераций для low-holder архивации
     CLEANER_LOW_HOLDER_MIN_COUNT = 300       # минимальное число холдеров для long-lived токена
