@@ -3,7 +3,7 @@
 Standalone manual BUY script via Jupiter.
 
 Usage example:
-  python3 server/manual_buy.py \
+  python3 -m server.manual.buy \
       --key-id 2 \
       --token-address 8Tg6NK4nVe3uCz9FqhGqoY7Ed22th2YLULvCnRNnPBjR \
       --amount-usd 1.0 \

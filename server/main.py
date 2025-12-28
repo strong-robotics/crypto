@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Body, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from _v3_tokens_reader import TokensReaderV3
@@ -30,9 +30,8 @@ from config import config
 
 from _v3_db_pool import get_db_pool, close_db_pool
 from ai.infer.service import get_forecast_runner
-from config import config
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 STOP_SCRIPT_PATH = PROJECT_ROOT / "stop.sh"
 
 
@@ -58,29 +57,18 @@ class AppStateV3:
         self.live_trades = None
         self.ai_forecast = None
         self.metrics_ticker = None
-        self.history_mode_override: Optional[bool] = None
 
 
 state = AppStateV3()
 
 
 def history_mode_enabled() -> bool:
-    if state.history_mode_override is not None:
-        return state.history_mode_override
     env_value = os.getenv("TOKENS_SHOW_HISTORY")
     fallback = getattr(config, 'TOKENS_SHOW_HISTORY', False)
     flag = env_value if env_value is not None else fallback
     if isinstance(flag, bool):
         return flag
     return str(flag).lower() not in ("0", "false", "none", "")
-
-
-async def set_history_mode(enabled: bool):
-    state.history_mode_override = bool(enabled)
-    if state.tokens_reader:
-        state.tokens_reader.set_history_mode(enabled)
-    if state.chart_data_reader:
-        state.chart_data_reader.set_history_mode(enabled)
 
 
 # ============================================================================
@@ -91,14 +79,12 @@ async def ensure_tokens_reader():
     if state.tokens_reader is None:
         state.tokens_reader = TokensReaderV3(debug=True)
         await state.tokens_reader.ensure_connection()
-    state.tokens_reader.set_history_mode(history_mode_enabled())
 
 
 async def ensure_chart_data_reader():
     if state.chart_data_reader is None:
         state.chart_data_reader = ChartDataReaderV3(debug=True)
         await state.chart_data_reader.ensure_connection()
-    state.chart_data_reader.set_history_mode(history_mode_enabled())
 
 
 async def ensure_balance_monitor():
@@ -302,10 +288,9 @@ async def websocket_balances(websocket: WebSocket):
 # ============================================================================
 
 @app.post("/api/system/timers/start")
-async def api_start_all_timers(mode: str = Query("live")):
-    requested_mode = (mode or "live").strip().lower()
-    is_history_mode = requested_mode == "history"
-    await set_history_mode(is_history_mode)
+async def api_start_all_timers():
+    if history_mode_enabled():
+        return {"success": False, "error": "history_mode_active"}
     results = {}
     # Balance
     await ensure_balance_monitor()
@@ -335,6 +320,8 @@ async def api_start_all_timers(mode: str = Query("live")):
 
 @app.post("/api/system/timers/stop")
 async def api_stop_all_timers():
+    if history_mode_enabled():
+        return {"success": False, "error": "history_mode_active"}
     results = {}
     # WS timers
     if state.balance_monitor:
@@ -429,8 +416,7 @@ async def api_timers_status():
         "analyzer": {"is_scanning": state.jupiter_analyzer.is_scanning if state.jupiter_analyzer else False},
         "live_trades": {"is_running": state.live_trades.is_running if state.live_trades else False},
         "ai_forecast": {**(state.ai_forecast.get_status() if state.ai_forecast else {"is_running": False}), "name": config.AI_NAME},
-        "metrics_ticker": {"is_running": False},
-        "mode": "history" if history_mode_enabled() else "live"
+        "metrics_ticker": {"is_running": False}
     }
     return {"success": True, "status": status}
 
@@ -612,32 +598,9 @@ async def api_stop_new_tokens():
         if not sched.is_running:
             return {"success": False, "message": "Scheduler not running"}
         
-        sched.set_manual_scanner_skip(True)
+        # Set flag to skip scanner ticks
+        sched._skip_scanner = True
         return {"success": True, "message": "New tokens scanner stopped (analyzer continues)"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.post("/api/new-tokens/start")
-async def api_start_new_tokens():
-    """Resume new tokens scanner after manual stop"""
-    try:
-        sched = await get_scheduler()
-        if not sched.is_running:
-            return {"success": False, "message": "Scheduler not running"}
-        sched.set_manual_scanner_skip(False)
-        return {"success": True, "message": "New tokens scanner resumed"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.get("/api/new-tokens/status")
-async def api_new_tokens_status():
-    try:
-        sched = await get_scheduler()
-        state = sched.get_scanner_state()
-        state["scanner_active"] = sched.is_scanner_active()
-        return {"success": True, **state}
     except Exception as e:
         return {"success": False, "error": str(e)}
 

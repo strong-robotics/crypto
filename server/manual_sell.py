@@ -3,7 +3,7 @@
 Manual standalone token sell script.
 
 Usage:
-  python3 server/manual_sell.py \
+  python3 -m server.manual.sell \
       --key-id 2 \
       --token-address 8Tg6NK4nVe3uCz9FqhGqoY7Ed22th2YLULvCnRNnPBjR \
       --amount all \

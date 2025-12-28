@@ -1215,6 +1215,31 @@ class JupiterAnalyzerV3:
                                 # current_value_sol = (entry_token_amount * current_price) / current_sol_price
                                 current_value_sol = (entry_token_amount * current_price) / current_sol_price if current_sol_price > 0 else 0
                                 
+                                # Calculate current portfolio value in USD
+                                current_portfolio_value_usd = entry_token_amount * current_price
+                                
+                                # Calculate SOL growth
+                                sol_growth = current_value_sol - entry_amount_sol
+                                
+                                # Calculate portfolio growth percentage
+                                portfolio_growth_pct = ((current_portfolio_value_usd - entry_amount_usd) / entry_amount_usd * 100) if entry_amount_usd > 0 else 0
+                                
+                                # Get market cap from tokens table
+                                mcap_row = await conn.fetchrow(
+                                    "SELECT mcap FROM tokens WHERE id=$1",
+                                    token_id
+                                )
+                                mcap = float(mcap_row.get("mcap") or 0) if mcap_row else 0
+                                
+                                # Log portfolio growth every second
+                                print(f"[Analyzer] 📊 Token {token_id} Portfolio Update:")
+                                print(f"  - Market Cap: ${mcap:,.2f}")
+                                print(f"  - Token Price: ${current_price:.8f}")
+                                print(f"  - Entry Amount (SOL): {entry_amount_sol:.6f} SOL")
+                                print(f"  - Current Portfolio Value (SOL): {current_value_sol:.6f} SOL")
+                                print(f"  - SOL Growth: {sol_growth:+.6f} SOL ({sol_growth * current_sol_price:+.2f} USD)")
+                                print(f"  - Portfolio Growth: {portfolio_growth_pct:+.2f}%")
+                                
                                 # Get TARGET_RETURN from config
                                 target_return = float(getattr(config, 'TARGET_RETURN', 0.035))
                                 

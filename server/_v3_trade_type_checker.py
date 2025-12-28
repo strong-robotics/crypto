@@ -21,18 +21,21 @@ from _v2_sol_price import get_current_sol_price
 def _get_helius_api_key() -> str:
     """Отримати Helius API ключ з HELIUS_RPC або config"""
     # Спробувати з config
+    # Спробувати з config
     if config.HELIUS_API_KEY:
         return config.HELIUS_API_KEY
     
-    # Спробувати витягти з HELIUS_RPC в _v2_buy_sell.py
     try:
         import os
-        buy_sell_path = os.path.join(os.path.dirname(__file__), '_v2_buy_sell.py')
-        with open(buy_sell_path, 'r') as f:
-            content = f.read()
-        match = re.search(r'HELIUS_RPC\s*=\s*["\']https://[^"\']*api-key=([^"\']+)', content)
-        if match:
-            return match.group(1)
+        # Fallback to _v2_buy_sell.py in current directory
+        buy_sell_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_v2_buy_sell.py')
+        
+        if os.path.exists(buy_sell_path):
+            with open(buy_sell_path, 'r') as f:
+                content = f.read()
+            match = re.search(r'HELIUS_RPC\s*=\s*["\']https://[^"\']*api-key=([^"\']+)', content)
+            if match:
+                return match.group(1)
     except Exception:
         pass
     

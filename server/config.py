@@ -13,7 +13,7 @@ class Config:
     # ============================================================================
     
     # Project paths
-    BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     
     # Jupiter API
     JUPITER_RECENT_API = "https://lite-api.jup.ag/tokens/v2/recent"
@@ -246,7 +246,6 @@ class Config:
     ZERO_TAIL_CONSEC_SEC = 120  # нужно 120 последовательных пустых итераций, чтобы признать токен «мертвым»
     ZERO_TAIL_MIN_FILL_RATIO = 0.40  # если фактических секунд < 40% от реального возраста → считаем график мертвым
     ZERO_TAIL_MIN_FILL_LIFE_SEC = 180  # проверять fill ratio только после 3 минут жизни токена
-    MEDIAN_MIN_ITERATIONS = 50  # purge tokens that never get median trades after N iterations
     # Do NOT trigger zero-liquidity guard until token прожил минимум столько секунд.
     CLEANER_LOW_HOLDER_ITER_THRESHOLD = 500  # минимальное количество итераций для low-holder архивации
     CLEANER_LOW_HOLDER_MIN_COUNT = 300       # минимальное число холдеров для long-lived токена
