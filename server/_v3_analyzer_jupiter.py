@@ -59,7 +59,7 @@ class JupiterAnalyzerV3:
         self.withdraw_equal_eps: float = float(getattr(config, 'LIQUIDITY_WITHDRAW_EQUAL_EPS', 1e-6))
         self.segment_series_limit: int = max(1000, self.withdraw_check_iter + self.withdraw_window)
 
-        # Track last trade-type checkpoint per token (0/35/85/170) to avoid spamming Helius
+        # Track last trade-type checkpoint per token (250/700/1000) to avoid spamming Helius
         self.trade_check_done = {}
 
         try:
@@ -162,7 +162,7 @@ class JupiterAnalyzerV3:
         if entry_price <= 0:
             return False
         
-        # Check prices in post-entry window (155-170s)
+        # Check prices in post-entry window (940-1000s)
         post_entry_start_idx = entry_idx
         post_entry_end_idx = min(post_entry_end, len(prices))
         
@@ -405,7 +405,7 @@ class JupiterAnalyzerV3:
             # if getattr(config, "DEBUG", False):
             #     print(f"[JUNO] token {token_id}: liquidity withdrawal detected (flat/zero metrics from iter {withdraw_iter}, window={self.withdraw_window})")
         
-        # Post-entry drop detection: check if price drops significantly after entry point (155-170s)
+        # Post-entry drop detection: check if price drops significantly after entry point (940-1000s)
         # This prevents buying tokens that look good at 155s but crash immediately after
         post_entry_drop_detected = False
         try:
@@ -422,8 +422,8 @@ class JupiterAnalyzerV3:
                     or 0
                 )
             
-            # Only check post-entry drop if token has enough data (>= 170s)
-            post_entry_end_sec = int(getattr(config, 'PRICE_CORRIDOR_FINAL_END', 170))
+            # Only check post-entry drop if token has enough data (>= 1000s)
+            post_entry_end_sec = int(getattr(config, 'PRICE_CORRIDOR_FINAL_END', 1000))
             if total_points >= post_entry_end_sec:
                 # Get all prices up to post_entry_end_sec
                 price_rows = await conn.fetch(
@@ -460,11 +460,11 @@ class JupiterAnalyzerV3:
             pass
         
         # MIN_TX_COUNT and MIN_SELL_SHARE validation (after third segment completes)
-        # CRITICAL: Check only AFTER third segment completes (170s) to ensure all pattern segments are analyzed
+        # CRITICAL: Check only AFTER third segment completes (1000s) to ensure all pattern segments are analyzed
         # Uses same iteration count as auto-buy: COUNT(*) WHERE usd_price IS NOT NULL AND usd_price > 0
         try:
-            # Get third segment end point (PRICE_CORRIDOR_FINAL_END, typically 170s)
-            third_segment_end = int(getattr(config, 'PRICE_CORRIDOR_FINAL_END', 170))
+            # Get third segment end point (PRICE_CORRIDOR_FINAL_END, typically 1000s)
+            third_segment_end = int(getattr(config, 'PRICE_CORRIDOR_FINAL_END', 1000))
             min_tx = float(getattr(config, "MIN_TX_COUNT", 100))
             min_sell_share = float(getattr(config, "MIN_SELL_SHARE", 0.2))
             
@@ -1390,7 +1390,7 @@ class JupiterAnalyzerV3:
                                     has_real_trading_final = False
                                     if basic_conditions and final_decision_ready and momentum_ok:
                                         # Final check: Verify real trading (SWAP) before auto-buy
-                                        # Use cached result from DB (already checked at segment checkpoints: 35s, 85s, 170s)
+                                        # Use cached result from DB (already checked at segment checkpoints: 250s, 700s, 1000s)
                                         has_real_trading_final = await conn.fetchval(
                                             "SELECT has_real_trading FROM tokens WHERE id=$1",
                                             token_id
@@ -1630,7 +1630,7 @@ class JupiterAnalyzerV3:
             getattr(config, 'PRICE_CORRIDOR_PRE_ENABLED', False),
             "pre",
             getattr(config, 'PRICE_CORRIDOR_PRE_START', 75),
-            getattr(config, 'PRICE_CORRIDOR_PRE_END', 85),
+            getattr(config, 'PRICE_CORRIDOR_PRE_END', 730),
             getattr(config, 'PRICE_CORRIDOR_PRE_DROP_THRESHOLD', 0.18),
             getattr(config, 'PRICE_CORRIDOR_PRE_RECOVERY_MIN', 0.5),
         )

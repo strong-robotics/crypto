@@ -1,5 +1,6 @@
 "use client";
 
+import React from "react";
 import { AreaChartComponent, type AreaChartComponentProps } from "../charts/area-chart";
 
 type MarkerInput = {
@@ -84,8 +85,26 @@ interface TokenCellProps {
   targetReturn?: number;  // TARGET_RETURN from backend config
 }
 
+function arePropsEqual(prevProps: TokenCellProps, nextProps: TokenCellProps) {
+  return (
+    prevProps.id === nextProps.id &&
+    prevProps.walletId === nextProps.walletId &&
+    prevProps.currentPrice === nextProps.currentPrice &&
+    prevProps.income === nextProps.income &&
+    prevProps.mcap === nextProps.mcap &&
+    prevProps.holders === nextProps.holders &&
+    prevProps.buySell === nextProps.buySell &&
+    prevProps.liveSeconds === nextProps.liveSeconds &&
+    prevProps.patternDecision === nextProps.patternDecision &&
+    prevProps.cur_income_price_usd === nextProps.cur_income_price_usd &&
+    prevProps.profit_usd === nextProps.profit_usd &&
+    prevProps.profit_pct_sol === nextProps.profit_pct_sol &&
+    JSON.stringify(prevProps.chartData) === JSON.stringify(nextProps.chartData) &&
+    JSON.stringify(prevProps.forecastData) === JSON.stringify(nextProps.forecastData)
+  );
+}
 
-export function TokenCell({
+export const TokenCell = React.memo(function TokenCell({
   index,
   tokenId,
   id,
@@ -163,7 +182,7 @@ export function TokenCell({
   //   console.log("  - chartData max:", chartData && chartData.length > 0 ? Math.max(...chartData) : 'N/A');
   //   console.log("  - chartData all values:", chartData);
   // }
-  
+
   // Get current portfolio value from backend (all calculations on server)
   const chartSeconds = (Array.isArray(chartData) && chartData.length > 0)
     ? chartData.length
@@ -228,13 +247,13 @@ export function TokenCell({
     typeof profit_usd === 'number' && Number.isFinite(profit_usd)
       ? profit_usd
       : (investedUsd !== null && typeof currentPortfolioValue === 'number'
-          ? currentPortfolioValue - investedUsd
-          : null);
+        ? currentPortfolioValue - investedUsd
+        : null);
   const currentProfitUsd =
     typeof computedProfitCandidate === 'number' && Number.isFinite(computedProfitCandidate)
       ? computedProfitCandidate
       : null;
-  
+
   // Determine circle color based on profit/loss from backend
   // Green: profit (virtual_income > 0)
   // Red: loss (virtual_income < 0)
@@ -253,30 +272,30 @@ export function TokenCell({
   const exitActualSec: number | null = (typeof exit_iteration === 'number') ? exit_iteration : null;
   const exitPlanSec: number | null = (typeof plan_sell_iteration === 'number') ? plan_sell_iteration : null;
   const chartExitSec: number | null = exitActualSec ?? exitPlanSec;
-  
+
   // Calculate exit price per token: use actual exit price, or plan_sell_price_usd, or calculate from entry_price_usd with targetReturn from config
   const exitPricePerToken =
     exitActualSec !== null && typeof exit_price_usd === 'number'
       ? exit_price_usd
-      : (typeof plan_sell_price_usd === 'number' 
-          ? plan_sell_price_usd 
-          : (typeof entry_price_usd === 'number' && entry_price_usd > 0
-              ? entry_price_usd * (1.0 + targetReturn)
-              : null));
-  
+      : (typeof plan_sell_price_usd === 'number'
+        ? plan_sell_price_usd
+        : (typeof entry_price_usd === 'number' && entry_price_usd > 0
+          ? entry_price_usd * (1.0 + targetReturn)
+          : null));
+
   const exitTokens: number | null = exitActualSec !== null
     ? (typeof exit_token_amount === 'number'
-        ? exit_token_amount
-        : (typeof entry_token_amount === 'number' ? entry_token_amount : null))
+      ? exit_token_amount
+      : (typeof entry_token_amount === 'number' ? entry_token_amount : null))
     : (typeof entry_token_amount === 'number' ? entry_token_amount : null);
-  
+
   // Calculate exit value: use exitTokens * exitPricePerToken, or fallback to entry_amount * (1 + targetReturn from config)
   const exitValueUsd =
     exitTokens !== null && exitPricePerToken !== null
       ? exitTokens * exitPricePerToken
       : (investedUsd !== null && investedUsd > 0
-          ? investedUsd * (1.0 + targetReturn)
-          : null);
+        ? investedUsd * (1.0 + targetReturn)
+        : null);
   const exitProfitUsd =
     exitValueUsd !== null && investedUsd !== null
       ? exitValueUsd - investedUsd
@@ -306,7 +325,7 @@ export function TokenCell({
     const remainingSeconds = seconds % 60;
     return `${minutes}m ${remainingSeconds}s`;
   };
-  
+
   // Логування для налагодження
   if (name === 'Meteora' || name === '华莱士🍔') {
     console.log(`🔍 DEBUG Token ${name}:`, {
@@ -327,7 +346,7 @@ export function TokenCell({
     if (v >= 1) return `$${v.toFixed(2)}`;
     // For 0 < v < 1 — up to 10 decimals, trim trailing zeros
     const s = v.toFixed(10);
-    return `$${s.replace(/\.?(0+)$/,'')}`;
+    return `$${s.replace(/\.?(0+)$/, '')}`;
   };
   const medianDisplay = normalizedMedianAmountUsd !== null ? ` (${formatUsdAmount(normalizedMedianAmountUsd)})` : "";
 
@@ -678,7 +697,7 @@ export function TokenCell({
             <button onClick={async () => {
               try {
                 await fetch(`http://localhost:8002/api/buy/force?token_id=${id}`, { method: 'POST' });
-              } catch (e) {}
+              } catch (e) { }
             }} title="Buy now" style={{
               fontSize: '14px',
               fontWeight: 'bold',
@@ -704,4 +723,4 @@ export function TokenCell({
       </div>
     </div >
   );
-}
+}, arePropsEqual);

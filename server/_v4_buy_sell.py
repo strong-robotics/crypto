@@ -1718,11 +1718,9 @@ async def execute_sell(
         
         # actual_amount_sold is already calculated above based on balance change
         # This ensures we record the REAL amount sold, not just what we tried to sell
-        exit_slippage_bps = sell_result.get("slippage_bps", 0)
+        # Database optimization: slippage_bps and expected/actual amounts removed from storage
         exit_slippage_pct = sell_result.get("slippage_pct", 0)
         exit_price_impact_pct = sell_result.get("price_impact_pct", 0)
-        exit_expected_amount_usd = sell_result.get("expected_amount_usd", 0)
-        exit_actual_amount_usd = sell_result.get("actual_amount_usd", 0)
         try:
             await conn.execute(
                 """
@@ -1732,22 +1730,18 @@ async def execute_sell(
                   exit_amount_usd=$3,
                   exit_signature=$4,
                   exit_iteration=$5,
-                  exit_slippage_bps=$6,
-                  exit_slippage_pct=$7,
-                  exit_price_impact_pct=$8,
-                  exit_transaction_fee_sol=$9,
-                  exit_transaction_fee_usd=$10,
-                  exit_expected_amount_usd=$11,
-                  exit_actual_amount_usd=$12,
+                  exit_slippage_pct=$6,
+                  exit_price_impact_pct=$7,
+                  exit_transaction_fee_sol=$8,
+                  exit_transaction_fee_usd=$9,
                   outcome='closed',
                   reason='manual',
                   updated_at=CURRENT_TIMESTAMP
-                WHERE wallet_id=$13 AND token_id=$14 AND exit_iteration IS NULL
+                WHERE wallet_id=$10 AND token_id=$11 AND exit_iteration IS NULL
                 """,
                 actual_amount_sold, price_usd, actual_usd_received, signature, exit_iteration,
-                exit_slippage_bps, exit_slippage_pct, exit_price_impact_pct,
+                exit_slippage_pct, exit_price_impact_pct,
                 fee_sol_val, fee_usd_val,
-                exit_expected_amount_usd, exit_actual_amount_usd,
                 wallet_id, token_id
             )
             print(f"[sell_real] 📝 Updated wallet_history{sim_status}:")
@@ -2212,17 +2206,16 @@ async def buy_real(token_id: int, *, source: str = 'auto_buy', simulate: bool = 
                 INSERT INTO wallet_history(
                     wallet_id, token_id,
                     entry_amount_usd, entry_token_amount, entry_price_usd, entry_iteration,
-                    entry_slippage_bps, entry_slippage_pct, entry_price_impact_pct, entry_transaction_fee_sol, entry_transaction_fee_usd,
-                    entry_expected_amount_usd, entry_actual_amount_usd, entry_signature, entry_sol_price,
+                    entry_slippage_pct, entry_price_impact_pct, entry_transaction_fee_sol, entry_transaction_fee_usd,
+                    entry_signature, entry_sol_price,
                     outcome, reason, created_at, updated_at
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'','manual',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'','manual',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
                 RETURNING id
                 """,
                 key_id, token_id,
                 entry_amount_usd, buy_result.get("amount_tokens"), buy_result.get("price_usd"), entry_iteration,
-                buy_result.get("slippage_bps", 0), buy_result.get("slippage_pct"), buy_result.get("price_impact_pct"),
+                buy_result.get("slippage_pct"), buy_result.get("price_impact_pct"),
                 buy_result.get("transaction_fee_sol"), buy_result.get("transaction_fee_usd"),
-                buy_result.get("expected_amount_usd", 0), buy_result.get("actual_amount_usd", 0),
                 buy_result.get("signature"), entry_sol_price
             )
             print(f"[buy_real] 📝 Recorded in wallet_history{sim_status}:")

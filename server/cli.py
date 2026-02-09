@@ -13,8 +13,8 @@ from _v3_analyzer_jupiter import (
     refresh_missing_jupiter_data,
     refresh_until_three,
 )
-from _v3_tokens_reader import TokensReaderV3
-from _v3_chart_data_reader import ChartDataReaderV3
+from _v4_tokens_reader import TokensReaderV4 as TokensReaderV3
+from _v4_chart_data_reader import ChartDataReaderV4 as ChartDataReaderV3
 from _v2_balance import BalanceV1
 from _v3_new_tokens import get_scanner as get_jupiter_scanner
 from _v3_analyzer_jupiter import get_analyzer as get_jupiter_analyzer

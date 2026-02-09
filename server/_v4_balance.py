@@ -10,7 +10,7 @@ from _v2_sol_price import get_current_sol_price
 from config import config
 from _v3_db_pool import get_db_pool
 
-class BalanceV1:
+class BalanceV4:
     def __init__(self):
         self.rpc_url = config.SOLANA_RPC_URL
         self.session = None
@@ -205,8 +205,8 @@ class BalanceV1:
                             balance_usd = sol_balance * sol_price if sol_price > 0 else 0.0
                             await conn.execute(
                                 """
-                                INSERT INTO wallets(id, name, initial_deposit_usd, cash_usd)
-                                VALUES($1, $2, $3, $3)
+                                INSERT INTO wallets(id, name, cash_usd)
+                                VALUES($1, $2, $3)
                                 """,
                                 wid, name, balance_usd
                             )

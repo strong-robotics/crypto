@@ -13,14 +13,14 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-from _v3_tokens_reader import TokensReaderV3
-from _v3_chart_data_reader import ChartDataReaderV3
-from _v2_balance import BalanceV1
+from _v4_tokens_reader import TokensReaderV4 as TokensReaderV3
+from _v4_chart_data_reader import ChartDataReaderV4 as ChartDataReaderV3
+from _v4_balance import BalanceV4
 from _v2_sol_price import get_sol_price_monitor
-from _v3_new_tokens import get_scanner as get_jupiter_scanner
-from _v3_analyzer_jupiter import get_analyzer as get_jupiter_analyzer
-from _v3_jupiter_scheduler import get_scheduler
-from _v2_buy_sell import force_sell as bs_force_sell, force_buy as bs_force_buy
+from _v4_new_tokens import get_scanner as get_jupiter_scanner
+from _v4_analyzer_jupiter import get_analyzer as get_jupiter_analyzer
+from _v4_jupiter_scheduler import get_scheduler
+from _v4_buy_sell import force_sell as bs_force_sell, force_buy as bs_force_buy
 # from _v1_buy_sell import sync_wallet_positions  # TODO: Function needs to be restored
 from _v3_live_trades import (
     get_live_trades_reader,
@@ -89,7 +89,7 @@ async def ensure_chart_data_reader():
 
 async def ensure_balance_monitor():
     if state.balance_monitor is None:
-        state.balance_monitor = BalanceV1()
+        state.balance_monitor = BalanceV4()
         await state.balance_monitor.__aenter__()
         await state.balance_monitor.load_balance_data()
 
@@ -353,7 +353,7 @@ async def api_stop_all_timers():
 
     # Force stop Analyzer (legacy) / unified Scheduler
     try:
-        from _v3_jupiter_scheduler import get_scheduler
+        from _v4_jupiter_scheduler import get_scheduler
 
         sched = await get_scheduler()
 
@@ -590,17 +590,34 @@ async def api_update_wallet_entry_amount(wallet_id: int, request: Request):
         return {"success": False, "error": str(e)}
 
 
-@app.post("/api/new-tokens/stop")
-async def api_stop_new_tokens():
-    """Stop new tokens scanner while keeping analyzer running"""
+@app.post("/api/new-tokens/start")
+async def api_start_new_tokens():
+    """Resume new tokens scanner ticks"""
     try:
         sched = await get_scheduler()
-        if not sched.is_running:
-            return {"success": False, "message": "Scheduler not running"}
-        
-        # Set flag to skip scanner ticks
-        sched._skip_scanner = True
-        return {"success": True, "message": "New tokens scanner stopped (analyzer continues)"}
+        sched.set_manual_scanner_skip(False)
+        return {"success": True, "message": "New tokens scanner resumed"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/new-tokens/stop")
+async def api_stop_new_tokens():
+    """Pause new tokens scanner while keeping analyzer running"""
+    try:
+        sched = await get_scheduler()
+        sched.set_manual_scanner_skip(True)
+        return {"success": True, "message": "New tokens scanner paused (analyzer continues)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/new-tokens/status")
+async def api_new_tokens_status():
+    """Get scanner state (running, paused, etc)"""
+    try:
+        sched = await get_scheduler()
+        return {"success": True, **sched.get_scanner_state()}
     except Exception as e:
         return {"success": False, "error": str(e)}
 

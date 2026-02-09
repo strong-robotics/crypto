@@ -428,11 +428,8 @@ async def init_database():
                 CREATE TABLE IF NOT EXISTS wallets (
                     id INTEGER PRIMARY KEY,
                     name VARCHAR(64),
-                    initial_deposit_usd NUMERIC(20,8) NOT NULL DEFAULT 5.5,
                     cash_usd NUMERIC(20,8) NOT NULL DEFAULT 5.5,
                     entry_amount_usd NUMERIC(20,8) NULL,
-                    active_token_id INTEGER NULL,
-                    total_profit_usd NUMERIC(20,8) NOT NULL DEFAULT 0.0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -644,10 +641,7 @@ async def create_tables(conn):
             exit_price_impact_pct NUMERIC(10,4),
             exit_transaction_fee_sol NUMERIC(20,8),
             exit_transaction_fee_usd NUMERIC(20,8),
-            exit_actual_amount_usd NUMERIC(20,8),
             exit_signature TEXT,
-            profit_usd NUMERIC(20,8),
-            profit_pct NUMERIC(10,4),
             outcome VARCHAR(16),
             reason VARCHAR(32),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

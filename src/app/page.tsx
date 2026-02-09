@@ -149,20 +149,20 @@ export default function Home() {
       chartData: [],
       totalTx: 0,
       buyTx: 0,
-    sellTx: 0,
-    liveSeconds: null,
-    plan_sell_iteration: null,
-    plan_sell_price_usd: null,
-    pattern_segments: ["unknown", "unknown", "unknown"],
-    pattern_segment_decision: null,
+      sellTx: 0,
+      liveSeconds: null,
+      plan_sell_iteration: null,
+      plan_sell_price_usd: null,
+      pattern_segments: ["unknown", "unknown", "unknown"],
+      pattern_segment_decision: null,
       medianAmountUsd: null,
-  }
-]);
+    }
+  ]);
 
   // Entry amounts state
   const [entryAmounts, setEntryAmounts] = useState<{ [key: number]: string }>({
     1: "5.0",
-    2: "6.0", 
+    2: "6.0",
     3: "5.0",
     4: "5.0",
     5: "5.0"
@@ -174,12 +174,12 @@ export default function Home() {
       ...prev,
       [walletId]: amount
     }));
-    
+
     // If field is empty, don't save to server (user is still editing)
     if (amount.trim() === '') {
       return;
     }
-    
+
     // Save to database via API
     try {
       const amountNum = parseFloat(amount);
@@ -188,7 +188,7 @@ export default function Home() {
         console.error(`Invalid entry amount: ${amount}`);
         return;
       }
-      
+
       const API_BASE = "http://localhost:8002";
       const response = await fetch(`${API_BASE}/api/wallet/${walletId}/entry-amount`, {
         method: 'PUT',
@@ -199,7 +199,7 @@ export default function Home() {
           entry_amount_usd: amountNum
         })
       });
-      
+
       if (!response.ok) {
         const error = await response.json();
         console.error(`Failed to save entry amount for wallet ${walletId}:`, error);
@@ -260,11 +260,11 @@ export default function Home() {
           // console.log("📨 Balance WebSocket message received:", event.data);
           const walletData: RawWalletMessage[] = JSON.parse(event.data);
           // console.log("📊 Parsed wallet data:", walletData);
-          
+
           // Конвертуємо дані з сервера в формат для WalletList
           const formattedWallets = walletData.map((wallet) => {
             const walletExt = wallet as RawWalletMessage & { cash_usd?: number | string; entry_amount_usd?: number | string; token_id?: number | string };
-            
+
             // Get entry_amount_usd from server (database value) or fallback to local state or default
             const serverEntryAmount = walletExt.entry_amount_usd;
             const entryAmountValue = (() => {
@@ -292,7 +292,7 @@ export default function Home() {
               // No local state - use server value or default
               return 5.0; // Default
             })();
-            
+
             // Update local state with server value if it exists (sync on first load)
             // BUT: Don't overwrite if user is currently editing (empty string in local state)
             // Allow 0 (wallet disabled) - check for valid number (>= 0)
@@ -314,7 +314,7 @@ export default function Home() {
                 });
               }
             }
-            
+
             return {
               id: wallet.id,
               name: wallet.name, // Назва з keys.json ("bot 1", "Ksu & Rich 2" тощо)
@@ -333,7 +333,7 @@ export default function Home() {
               })()
             };
           });
-          
+
           // console.log("🔄 Formatted wallets:", formattedWallets);
           setWallets(formattedWallets);
           // console.log("✅ Updated wallets state");
@@ -382,7 +382,7 @@ export default function Home() {
             target_return?: number;  // TARGET_RETURN from backend config
           };
           // console.log("📊 Parsed token data:", tokenData);
-          
+
           // Update token counts from database
           // total_found = tokens with valid pairs and history_ready = false
           // total_count = all tokens with history_ready = false
@@ -396,141 +396,141 @@ export default function Home() {
           if (tokenData.target_return !== undefined && typeof tokenData.target_return === 'number') {
             setTargetReturn(tokenData.target_return);
           }
-          
+
           if (tokenData.success && tokenData.tokens) {
             // Конвертуємо дані з сервера в формат для TokenList
             // ЗБЕРІГАЄМО chartData з попереднього стану, щоб не затирати графіки
             setTokens(prevTokens => {
               const byId = new Map(prevTokens.map(t => [t.id, t]));
               const formattedTokens: TokenState[] = (tokenData.tokens || []).map((token, index) => {
-              const liveSecondsRaw = token.live_seconds ?? token.iteration_count;
-              const liveSecondsValue = (() => {
-                if (liveSecondsRaw === null || liveSecondsRaw === undefined) return NaN;
-                if (typeof liveSecondsRaw === "number") return liveSecondsRaw;
-                const parsed = Number(liveSecondsRaw);
-                return Number.isFinite(parsed) ? parsed : NaN;
-              })();
-              const prev = byId.get(token.id);
-              const preservedChart = prev && Array.isArray(prev.chartData) && prev.chartData.length > 0
-                ? prev.chartData
-                : [];
-              const preservedForecast = prev && Array.isArray(prev.forecastData) && prev.forecastData.length > 0
-                ? prev.forecastData
-                : [];
+                const liveSecondsRaw = token.live_seconds ?? token.iteration_count;
+                const liveSecondsValue = (() => {
+                  if (liveSecondsRaw === null || liveSecondsRaw === undefined) return NaN;
+                  if (typeof liveSecondsRaw === "number") return liveSecondsRaw;
+                  const parsed = Number(liveSecondsRaw);
+                  return Number.isFinite(parsed) ? parsed : NaN;
+                })();
+                const prev = byId.get(token.id);
+                const preservedChart = prev && Array.isArray(prev.chartData) && prev.chartData.length > 0
+                  ? prev.chartData
+                  : [];
+                const preservedForecast = prev && Array.isArray(prev.forecastData) && prev.forecastData.length > 0
+                  ? prev.forecastData
+                  : [];
 
-              // ДІАГНОСТИКА для токена 1275
-              if (token.id === 1275) {
-                console.log(`🧪 Full list update for token 1275:`);
-                console.log(`  - newToken (from WS): chartDataLength=${preservedChart?.length || 0}, forecastDataLength=${preservedForecast?.length || 0}`);
-                console.log(`  - existingToken (from prev state): chartDataLength=${prev?.chartData?.length || 0}, forecastDataLength=${prev?.forecastData?.length || 0}`);
-              }
-
-              const priceNum = token.price === null || token.price === undefined ? NaN : Number(token.price);
-              const mcapNum = token.mcap === null || token.mcap === undefined ? NaN : Number(token.mcap);
-              const holdersNum = token.holders === null || token.holders === undefined ? NaN : Number(token.holders);
-              const toNumber = (value: unknown) => {
-                if (value === null || value === undefined) return NaN;
-                if (typeof value === "number") return value;
-                const parsed = Number(value);
-                return Number.isFinite(parsed) ? parsed : NaN;
-              };
-              // Real trading data from backend (wallet_history and tokens table)
-              const entryIterNum = toNumber(token.entry_iteration);
-              const exitIterNum = toNumber(token.exit_iteration);
-              const curIncomeNum = toNumber(token.cur_income_price_usd);
-              const curIncomeSolNum = toNumber(token.cur_income_price_sol);
-              const profitNum = toNumber(token.profit_usd);
-              const profitPctSolNum = toNumber(token.profit_pct_sol);
-              const entrySolPriceNum = toNumber(token.entry_sol_price);
-              const entryAmountNum = toNumber(token.entry_token_amount);
-              const exitAmountNum = toNumber(token.exit_token_amount);
-              const entryPriceNum = toNumber(token.entry_price_usd);
-              const exitPriceNum = toNumber(token.exit_price_usd);
-              const planSellIterNum = toNumber(token.plan_sell_iteration);
-              const planSellPriceNum = toNumber(token.plan_sell_price_usd);
-              const medianAmountUsdRaw = token.median_amount_usd;
-              const medianAmountUsdNum = (() => {
-                if (medianAmountUsdRaw === null || medianAmountUsdRaw === undefined) return NaN;
-                if (typeof medianAmountUsdRaw === "number") return medianAmountUsdRaw;
-                const parsed = Number(medianAmountUsdRaw);
-                return Number.isFinite(parsed) ? parsed : NaN;
-              })();
-              const normalizeSegment = (value: unknown, fallback: string) => {
-                if (typeof value === "string" && value.length > 0) {
-                  // Replace "unknown" with "-" to save space
-                  return value.toLowerCase() === "unknown" ? "-" : value;
+                // ДІАГНОСТИКА для токена 1275
+                if (token.id === 1275) {
+                  console.log(`🧪 Full list update for token 1275:`);
+                  console.log(`  - newToken (from WS): chartDataLength=${preservedChart?.length || 0}, forecastDataLength=${preservedForecast?.length || 0}`);
+                  console.log(`  - existingToken (from prev state): chartDataLength=${prev?.chartData?.length || 0}, forecastDataLength=${prev?.forecastData?.length || 0}`);
                 }
-                if (value === null || value === undefined) {
-                  // Replace fallback "unknown" with "-"
-                  return fallback.toLowerCase() === "unknown" ? "-" : fallback;
-                }
-                const strValue = String(value);
-                return strValue.toLowerCase() === "unknown" ? "-" : strValue;
-              };
-              const segment1 = normalizeSegment(token.pattern_segment_1, prev?.pattern_segments?.[0] || "-");
-              const segment2 = normalizeSegment(token.pattern_segment_2, prev?.pattern_segments?.[1] || "-");
-              const segment3 = normalizeSegment(token.pattern_segment_3, prev?.pattern_segments?.[2] || "-");
-              const patternSegments = [segment1, segment2, segment3];
-              const patternDecision = typeof token.pattern_segment_decision === "string"
-                ? token.pattern_segment_decision
-                : (prev?.pattern_segment_decision ?? null);
-              const result = {
-                index: index + 1,
-                tokenId: token.token_address, // mint address для відображення в заголовку
-                id: token.id, // INTEGER id з БД для matching з charts
-                scanCount: 0, // Default scan count
-                pattern: patternSegments.join(", "),
-                name: token.name || "Unknown",
-                token_pair: token.pair || undefined, // Trading pair з DexScreener
-                mcap: Number.isFinite(mcapNum) ? mcapNum : 0,
-                holders: Number.isFinite(holdersNum) ? holdersNum : 0,
-                buySell: 0,
-                buyPrice: 0,
-                currentPrice: Number.isFinite(priceNum) ? priceNum : 0,
-                income: 0, // Буде обчислено в компоненті
-                sellPrice: 0,
-                walletId: (() => {
-                  const walletIdRaw = token.wallet_id;
-                  if (walletIdRaw === null || walletIdRaw === undefined) return 0;
-                  const walletIdNum = Number(walletIdRaw);
-                  return Number.isFinite(walletIdNum) && walletIdNum > 0 ? walletIdNum : 0;
-                })(),
-                chartData: preservedChart,
-                forecastData: preservedForecast,
-                // Використовуємо поля, які реально повертає V3 tokens_reader
-                totalTx: (token.num_buys_24h || 0) + (token.num_sells_24h || 0),
-                buyTx: token.num_buys_24h || 0,
-                sellTx: token.num_sells_24h || 0,
-                liveSeconds: Number.isFinite(liveSecondsValue)
-                  ? liveSecondsValue
-                  : prev?.liveSeconds ?? null,
-                live_time: token.live_time,
-                // Real trading data from wallet_history and tokens table
-                // Use only server-provided values; if null → no entry/exit -> hide reference lines
-                entry_iteration: Number.isFinite(entryIterNum) ? entryIterNum : prev?.entry_iteration ?? null,
-                exit_iteration: (() => {
-                  if (Number.isFinite(exitIterNum)) return exitIterNum;
-                  return prev?.exit_iteration ?? null;
-                })(),
-                cur_income_price_usd: Number.isFinite(curIncomeNum) ? curIncomeNum : prev?.cur_income_price_usd ?? null,
-                cur_income_price_sol: Number.isFinite(curIncomeSolNum) ? curIncomeSolNum : prev?.cur_income_price_sol ?? null,
-                profit_pct_sol: Number.isFinite(profitPctSolNum) ? profitPctSolNum : prev?.profit_pct_sol ?? null,
-                entry_sol_price: Number.isFinite(entrySolPriceNum) ? entrySolPriceNum : prev?.entry_sol_price ?? null,
-                profit_usd: Number.isFinite(profitNum) ? profitNum : prev?.profit_usd ?? null,
-                entry_token_amount: Number.isFinite(entryAmountNum) ? entryAmountNum : prev?.entry_token_amount ?? null,
-                exit_token_amount: Number.isFinite(exitAmountNum) ? exitAmountNum : prev?.exit_token_amount ?? null,
-                entry_price_usd: Number.isFinite(entryPriceNum) ? entryPriceNum : prev?.entry_price_usd ?? null,
-                exit_price_usd: Number.isFinite(exitPriceNum) ? exitPriceNum : prev?.exit_price_usd ?? null,
-                plan_sell_iteration: Number.isFinite(planSellIterNum) ? planSellIterNum : prev?.plan_sell_iteration ?? null,
-                plan_sell_price_usd: Number.isFinite(planSellPriceNum) ? planSellPriceNum : prev?.plan_sell_price_usd ?? null,
-                pattern_segments: patternSegments,
-                pattern_segment_decision: patternDecision,
-                has_real_trading: token.has_real_trading ?? null,
-                medianAmountUsd: Number.isFinite(medianAmountUsdNum) ? medianAmountUsdNum : (prev?.medianAmountUsd ?? null),
-              };
 
-              return result;
-            });
+                const priceNum = token.price === null || token.price === undefined ? NaN : Number(token.price);
+                const mcapNum = token.mcap === null || token.mcap === undefined ? NaN : Number(token.mcap);
+                const holdersNum = token.holders === null || token.holders === undefined ? NaN : Number(token.holders);
+                const toNumber = (value: unknown) => {
+                  if (value === null || value === undefined) return NaN;
+                  if (typeof value === "number") return value;
+                  const parsed = Number(value);
+                  return Number.isFinite(parsed) ? parsed : NaN;
+                };
+                // Real trading data from backend (wallet_history and tokens table)
+                const entryIterNum = toNumber(token.entry_iteration);
+                const exitIterNum = toNumber(token.exit_iteration);
+                const curIncomeNum = toNumber(token.cur_income_price_usd);
+                const curIncomeSolNum = toNumber(token.cur_income_price_sol);
+                const profitNum = toNumber(token.profit_usd);
+                const profitPctSolNum = toNumber(token.profit_pct_sol);
+                const entrySolPriceNum = toNumber(token.entry_sol_price);
+                const entryAmountNum = toNumber(token.entry_token_amount);
+                const exitAmountNum = toNumber(token.exit_token_amount);
+                const entryPriceNum = toNumber(token.entry_price_usd);
+                const exitPriceNum = toNumber(token.exit_price_usd);
+                const planSellIterNum = toNumber(token.plan_sell_iteration);
+                const planSellPriceNum = toNumber(token.plan_sell_price_usd);
+                const medianAmountUsdRaw = token.median_amount_usd;
+                const medianAmountUsdNum = (() => {
+                  if (medianAmountUsdRaw === null || medianAmountUsdRaw === undefined) return NaN;
+                  if (typeof medianAmountUsdRaw === "number") return medianAmountUsdRaw;
+                  const parsed = Number(medianAmountUsdRaw);
+                  return Number.isFinite(parsed) ? parsed : NaN;
+                })();
+                const normalizeSegment = (value: unknown, fallback: string) => {
+                  if (typeof value === "string" && value.length > 0) {
+                    // Replace "unknown" with "-" to save space
+                    return value.toLowerCase() === "unknown" ? "-" : value;
+                  }
+                  if (value === null || value === undefined) {
+                    // Replace fallback "unknown" with "-"
+                    return fallback.toLowerCase() === "unknown" ? "-" : fallback;
+                  }
+                  const strValue = String(value);
+                  return strValue.toLowerCase() === "unknown" ? "-" : strValue;
+                };
+                const segment1 = normalizeSegment(token.pattern_segment_1, prev?.pattern_segments?.[0] || "-");
+                const segment2 = normalizeSegment(token.pattern_segment_2, prev?.pattern_segments?.[1] || "-");
+                const segment3 = normalizeSegment(token.pattern_segment_3, prev?.pattern_segments?.[2] || "-");
+                const patternSegments = [segment1, segment2, segment3];
+                const patternDecision = typeof token.pattern_segment_decision === "string"
+                  ? token.pattern_segment_decision
+                  : (prev?.pattern_segment_decision ?? null);
+                const result = {
+                  index: index + 1,
+                  tokenId: token.token_address, // mint address для відображення в заголовку
+                  id: token.id, // INTEGER id з БД для matching з charts
+                  scanCount: 0, // Default scan count
+                  pattern: patternSegments.join(", "),
+                  name: token.name || "Unknown",
+                  token_pair: token.pair || undefined, // Trading pair з DexScreener
+                  mcap: Number.isFinite(mcapNum) ? mcapNum : 0,
+                  holders: Number.isFinite(holdersNum) ? holdersNum : 0,
+                  buySell: 0,
+                  buyPrice: 0,
+                  currentPrice: Number.isFinite(priceNum) ? priceNum : 0,
+                  income: 0, // Буде обчислено в компоненті
+                  sellPrice: 0,
+                  walletId: (() => {
+                    const walletIdRaw = token.wallet_id;
+                    if (walletIdRaw === null || walletIdRaw === undefined) return 0;
+                    const walletIdNum = Number(walletIdRaw);
+                    return Number.isFinite(walletIdNum) && walletIdNum > 0 ? walletIdNum : 0;
+                  })(),
+                  chartData: preservedChart,
+                  forecastData: preservedForecast,
+                  // Використовуємо поля, які реально повертає V3 tokens_reader
+                  totalTx: (token.num_buys_24h || 0) + (token.num_sells_24h || 0),
+                  buyTx: token.num_buys_24h || 0,
+                  sellTx: token.num_sells_24h || 0,
+                  liveSeconds: Number.isFinite(liveSecondsValue)
+                    ? liveSecondsValue
+                    : prev?.liveSeconds ?? null,
+                  live_time: token.live_time,
+                  // Real trading data from wallet_history and tokens table
+                  // Use only server-provided values; if null → no entry/exit -> hide reference lines
+                  entry_iteration: Number.isFinite(entryIterNum) ? entryIterNum : prev?.entry_iteration ?? null,
+                  exit_iteration: (() => {
+                    if (Number.isFinite(exitIterNum)) return exitIterNum;
+                    return prev?.exit_iteration ?? null;
+                  })(),
+                  cur_income_price_usd: Number.isFinite(curIncomeNum) ? curIncomeNum : prev?.cur_income_price_usd ?? null,
+                  cur_income_price_sol: Number.isFinite(curIncomeSolNum) ? curIncomeSolNum : prev?.cur_income_price_sol ?? null,
+                  profit_pct_sol: Number.isFinite(profitPctSolNum) ? profitPctSolNum : prev?.profit_pct_sol ?? null,
+                  entry_sol_price: Number.isFinite(entrySolPriceNum) ? entrySolPriceNum : prev?.entry_sol_price ?? null,
+                  profit_usd: Number.isFinite(profitNum) ? profitNum : prev?.profit_usd ?? null,
+                  entry_token_amount: Number.isFinite(entryAmountNum) ? entryAmountNum : prev?.entry_token_amount ?? null,
+                  exit_token_amount: Number.isFinite(exitAmountNum) ? exitAmountNum : prev?.exit_token_amount ?? null,
+                  entry_price_usd: Number.isFinite(entryPriceNum) ? entryPriceNum : prev?.entry_price_usd ?? null,
+                  exit_price_usd: Number.isFinite(exitPriceNum) ? exitPriceNum : prev?.exit_price_usd ?? null,
+                  plan_sell_iteration: Number.isFinite(planSellIterNum) ? planSellIterNum : prev?.plan_sell_iteration ?? null,
+                  plan_sell_price_usd: Number.isFinite(planSellPriceNum) ? planSellPriceNum : prev?.plan_sell_price_usd ?? null,
+                  pattern_segments: patternSegments,
+                  pattern_segment_decision: patternDecision,
+                  has_real_trading: token.has_real_trading ?? null,
+                  medianAmountUsd: Number.isFinite(medianAmountUsdNum) ? medianAmountUsdNum : (prev?.medianAmountUsd ?? null),
+                };
+
+                return result;
+              });
 
               return formattedTokens;
             });
@@ -567,49 +567,86 @@ export default function Home() {
 
       wsChartRef.current.onmessage = (event) => {
         try {
-          const data = JSON.parse(event.data);
+          const rawData = JSON.parse(event.data);
 
-          // data = { id, token_id, token_pair, chart_data: [...], forecast_p50?: [...] }
-          const hasChart = data.id && Array.isArray(data.chart_data) && data.chart_data.length > 0;
-          const hasForecast = data.id && Array.isArray(data.forecast_p50) && data.forecast_p50.length > 0;
-          if (hasChart || hasForecast) {
+          // Helper to process individual update
+          const applyUpdate = (t: any, update: any) => {
+            const hasChart = Array.isArray(update.chart_data);
+            const hasForecast = Array.isArray(update.forecast_p50);
+
+            const prevChart = Array.isArray(t.chartData) ? t.chartData : [];
+            const prevForecast = Array.isArray(t.forecastData) ? t.forecastData : [];
+
+            let chartChanged = false;
+            if (hasChart) {
+              const newChart = update.chart_data;
+              chartChanged = newChart.length !== prevChart.length || newChart[newChart.length - 1] !== prevChart[prevChart.length - 1];
+            }
+
+            let forecastChanged = false;
+            if (hasForecast) {
+              const newForecast = update.forecast_p50;
+              forecastChanged = newForecast.length !== prevForecast.length || newForecast[newForecast.length - 1] !== prevForecast[prevForecast.length - 1];
+            }
+
+            // Always update plan data fields if they are present in the update
+            const planFields = {
+              plan_entry_sec: update.plan_entry_sec ?? t.plan_entry_sec,
+              plan_exit_sec: update.plan_exit_sec ?? t.plan_exit_sec,
+              plan_decision: update.plan_decision ?? t.plan_decision,
+              plan_eta_sec: update.plan_eta_sec ?? t.plan_eta_sec,
+              plan_confidence: update.plan_confidence ?? t.plan_confidence,
+              plan_drawdown: update.plan_drawdown ?? t.plan_drawdown,
+              plan_reason: update.plan_reason ?? t.plan_reason,
+              plan_prior: update.plan_prior ?? t.plan_prior,
+              plan_similarity: update.plan_similarity ?? t.plan_similarity,
+              plan_score: update.plan_score ?? t.plan_score,
+            };
+
+            if (!chartChanged && !forecastChanged &&
+              planFields.plan_decision === t.plan_decision &&
+              planFields.plan_score === t.plan_score) {
+              return t;
+            }
+
+            return {
+              ...t,
+              ...planFields,
+              chartData: chartChanged ? [...update.chart_data] : t.chartData,
+              forecastData: forecastChanged ? [...update.forecast_p50] : t.forecastData,
+            };
+          };
+
+          if (rawData.type === "chart_batch" && Array.isArray(rawData.data)) {
             setTokens(prevTokens => {
-              const idx = prevTokens.findIndex(t => t.id === data.id);
-              if (idx === -1) {
-                return prevTokens;
-              }
-              const current = prevTokens[idx];
-              const prevChart = Array.isArray(current.chartData) ? current.chartData : [];
-              const prevForecast = Array.isArray(current.forecastData) ? current.forecastData : [];
-              let chartChanged = false;
-              if (hasChart) {
-                const newChart = data.chart_data;
-                const prevLen = prevChart.length;
-                const newLen = newChart.length;
-                const prevLast = prevLen > 0 ? prevChart[prevLen - 1] : null;
-                const newLast = newLen > 0 ? newChart[newLen - 1] : null;
-                chartChanged = newLen !== prevLen || newLast !== prevLast;
-              }
-              let forecastChanged = false;
-              if (hasForecast) {
-                const newForecast = data.forecast_p50;
-                const prevLen = prevForecast.length;
-                const newLen = newForecast.length;
-                const prevLast = prevLen > 0 ? prevForecast[prevLen - 1] : null;
-                const newLast = newLen > 0 ? newForecast[newLen - 1] : null;
-                forecastChanged = newLen !== prevLen || newLast !== prevLast;
-              }
-              if (!chartChanged && !forecastChanged) {
-                return prevTokens;
-              }
               const next = [...prevTokens];
-              next[idx] = {
-                ...current,
-                chartData: chartChanged ? [...data.chart_data] : current.chartData,
-                forecastData: forecastChanged ? [...data.forecast_p50] : current.forecastData,
-              };
-              return next;
+              let changed = false;
+              rawData.data.forEach((update: any) => {
+                const idx = next.findIndex(t => t.id === update.id);
+                if (idx !== -1) {
+                  const updated = applyUpdate(next[idx], update);
+                  if (updated !== next[idx]) {
+                    next[idx] = updated;
+                    changed = true;
+                  }
+                }
+              });
+              return changed ? next : prevTokens;
             });
+          } else {
+            // Legacy/individual update
+            const update = rawData;
+            if (update.id) {
+              setTokens(prevTokens => {
+                const idx = prevTokens.findIndex(t => t.id === update.id);
+                if (idx === -1) return prevTokens;
+                const updated = applyUpdate(prevTokens[idx], update);
+                if (updated === prevTokens[idx]) return prevTokens;
+                const next = [...prevTokens];
+                next[idx] = updated;
+                return next;
+              });
+            }
           }
         } catch (err) {
           console.error("❌ Error parsing chart WebSocket message:", err);
@@ -718,7 +755,7 @@ export default function Home() {
     connectChartWebSocket();
     // Синхронизируемся с бэкендом
     await checkTimersStatus();
-    
+
     await checkAnalyzerStatus();
     await fetchScannerStatus();
   };
@@ -816,12 +853,12 @@ export default function Home() {
     fetchScannerStatus();
     checkTimersStatus();
     checkLiveTradesStatus();
-    
+
     // WebSocket'и НЕ підключаємо автоматично - тільки через кнопку Start
     // connectWebSocket();
     // connectTokensWebSocket();
     // connectChartWebSocket();
-    
+
     // НЕ закриваємо WebSocket'и в cleanup - вони мають працювати постійно
     // Cleanup спрацьовує в React Strict Mode двічі і закриває з'єднання
     // WebSocket'и будуть закриті автоматично при unmount компонента
@@ -906,8 +943,8 @@ export default function Home() {
         // paddingRight: '16px'
       }}>
         {/* Left Column - Wallet List */}
-        <WalletList 
-          wallets={sortedWallets} 
+        <WalletList
+          wallets={sortedWallets}
           entryAmounts={entryAmounts}
           onEntryAmountChange={handleEntryAmountChange}
         />
